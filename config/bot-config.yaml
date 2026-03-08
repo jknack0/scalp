@@ -1,0 +1,22 @@
+# MES Scalping Bot Configuration
+# ─────────────────────────────────────────────────────
+# Values here are safe defaults for paper trading.
+# Environment variables override these values.
+# Credentials should NEVER go in this file — use .env instead.
+
+# Trading parameters
+symbol: "MESH6"              # Front-month MES contract (update quarterly)
+session_start: "09:30"       # RTH open (Eastern)
+session_end: "16:00"         # RTH close (Eastern)
+timezone: "America/New_York"
+
+# Risk limits
+max_daily_loss_usd: 150.0         # Halt trading after this loss
+max_position_contracts: 1         # Max simultaneous contracts
+max_signals_per_day: 10           # Circuit breaker on signal count
+slippage_assumption_ticks: 1.0    # Assumed slippage per side
+
+# Monitoring
+health_port: 8080
+log_level: "INFO"
+log_file: "logs/bot.log"

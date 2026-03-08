@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(uv add statsmodels \"scipy>=1.12\" hurst)",
+      "Bash(uv sync --group dev)",
+      "WebSearch",
+      "WebFetch(domain:databento.com)",
+      "Bash(ls:*)",
+      "Bash(uv run:*)",
+      "Bash(uv sync:*)",
+      "WebFetch(domain:api.tradovate.com)",
+      "WebFetch(domain:partner.tradovate.com)"
+    ]
+  }
+}

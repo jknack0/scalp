@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep -l \"submit_order\\\\|place_order\")",
+      "Bash(find /c/Dev/scalp/src -name \"*.py\" -exec wc -l {} +)",
+      "Read(//c/Dev/scalp/**)",
+      "Bash(grep -n \"BacktestEngine\" src/backtesting/*.py)",
+      "Bash(python3:*)",
+      "Bash(/tmp/analysis_summary.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(xargs wc -l)",
+      "Bash(wc -l /c/Dev/scalp/src/data/*.py)",
+      "Bash(grep -c \"from src.backtesting import.*PendingOrder\\\\|PendingOrder\" /c/Dev/scalp/**/*.py)",
+      "Bash(grep -E \"^\\\\s{2}[A-Z]|^={2,}|^-{2,}|^\\\\s{4}\")",
+      "Bash(grep -E \"^\\\\s{2}|^={2,}\")",
+      "Bash(tasklist)"
+    ]
+  }
+}

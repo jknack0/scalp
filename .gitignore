@@ -1,0 +1,32 @@
+# Credentials — NEVER commit
+.env
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data (large files — keep locally, don't commit)
+data/parquet/
+data/dollar_bars/
+data/volume_profiles/
+data/l1/
+data/l2/
+data/
+*.csv
+
+# Trained model artifacts
+models/
+
+# Bot logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
