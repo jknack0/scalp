@@ -55,6 +55,7 @@ class TradovateAuth:
         self._config = config
         self._session: aiohttp.ClientSession | None = None
         self._access_token: str = ""
+        self._md_access_token: str = ""
         self._user_id: int | None = None
         self._expiry: float = 0.0  # Unix timestamp when token expires
 
@@ -65,6 +66,10 @@ class TradovateAuth:
     @property
     def access_token(self) -> str:
         return self._access_token
+
+    @property
+    def md_access_token(self) -> str:
+        return self._md_access_token
 
     @property
     def user_id(self) -> int | None:
@@ -102,6 +107,7 @@ class TradovateAuth:
             data = await resp.json()
 
         self._access_token = data["accessToken"]
+        self._md_access_token = data.get("mdAccessToken", "")
         self._user_id = data.get("userId")
         # Tradovate tokens last ~80 minutes; expirationTime is ISO string
         # Use a conservative 70-minute window from now
@@ -119,6 +125,7 @@ class TradovateAuth:
                     raise ConnectionError(f"Token refresh failed (HTTP {resp.status})")
                 data = await resp.json()
             self._access_token = data["accessToken"]
+            self._md_access_token = data.get("mdAccessToken", self._md_access_token)
             self._expiry = time.time() + 4200
             logger.info("token_refreshed")
         except Exception:
@@ -132,6 +139,14 @@ class TradovateAuth:
         elif self.is_expired:
             await self.refresh_token()
         return self._access_token
+
+    async def ensure_valid_md_token(self) -> str:
+        """Return a valid market data access token, refreshing if needed."""
+        if not self._md_access_token:
+            await self.authenticate()
+        elif self.is_expired:
+            await self.refresh_token()
+        return self._md_access_token
 
     async def close(self) -> None:
         """Close the HTTP session."""
@@ -203,8 +218,9 @@ class TradovateFeed(BaseFeed):
 
     async def connect(self) -> None:
         """Authenticate via REST, then open WebSocket and authorize."""
-        # REST authentication
-        token = await self._auth.ensure_valid_token()
+        # REST authentication — use the MD-specific token for market data WS
+        await self._auth.ensure_valid_token()
+        token = await self._auth.ensure_valid_md_token()
 
         # Open WebSocket
         self._ws_session = aiohttp.ClientSession()

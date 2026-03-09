@@ -22,6 +22,7 @@ from src.core.session import SessionManager
 from src.core.signal_handler import SignalHandler
 from src.core.tick_aggregator import TickAggregator
 from src.filters.spread_monitor import SpreadConfig, SpreadMonitor
+from src.feeds.databento_feed import DatabentoFeed
 from src.feeds.tradovate import TradovateFeed
 from src.features.feature_hub import FeatureHub
 from src.monitoring.health import HealthMonitor
@@ -141,12 +142,12 @@ async def main() -> None:
     # ── Fill monitor ─────────────────────────────────────────
     fill_monitor = FillMonitor(bus, oms)
 
-    # ── Feed ─────────────────────────────────────────────────
-    feed: TradovateFeed | None = None
-    if config.tradovate_username and config.tradovate_password:
-        feed = TradovateFeed(event_bus=bus, config=config)
+    # ── Feed (Databento for market data, Tradovate for orders only) ──
+    feed: DatabentoFeed | None = None
+    if config.databento_api_key:
+        feed = DatabentoFeed(event_bus=bus, config=config)
     else:
-        logger.warning("feed_skipped", reason="Tradovate credentials not configured")
+        logger.warning("feed_skipped", reason="DATABENTO_API_KEY not configured")
 
     # ── Session callbacks ────────────────────────────────────
     async def _on_session_open() -> None:

@@ -33,7 +33,8 @@
       "Bash(.venv/Scripts/python -c \"from src.strategies.iceberg_strategy import IcebergStrategy, IcebergStrategyConfig; print\\(''Strategy OK''\\); from src.backtesting.l2_replay import L2ReplayEngine, L2ReplayConfig; print\\(''Engine OK''\\)\")",
       "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
       "Bash(taskkill /PID 3832 /F)",
-      "Bash(cmd //c \"taskkill /PID 3832 /F\")"
+      "Bash(cmd //c \"taskkill /PID 3832 /F\")",
+      "WebFetch(domain:community.tradovate.com)"
     ]
   }
 }
