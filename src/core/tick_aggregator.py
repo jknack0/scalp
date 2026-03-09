@@ -145,8 +145,8 @@ class TickAggregator:
         )
 
         self._bar_count += 1
-        # Log every 12th bar (~once per minute with 5s bars)
-        if self._bar_count % 12 == 1:
+        # Log every 60th bar (~once per minute with 1s bars)
+        if self._bar_count % 60 == 1:
             logger.info(
                 "bar_emitted",
                 bar_num=self._bar_count,
