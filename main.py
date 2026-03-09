@@ -42,8 +42,8 @@ def _parse_args() -> argparse.Namespace:
         help="Strategy names to run (default: all). Options: orb",
     )
     parser.add_argument(
-        "--bar-interval", type=float, default=5.0,
-        help="Bar aggregation interval in seconds (default: 5)",
+        "--bar-interval", type=float, default=1.0,
+        help="Bar aggregation interval in seconds (default: 1)",
     )
     return parser.parse_args()
 
