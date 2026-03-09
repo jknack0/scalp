@@ -12,13 +12,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Data (large files — keep locally, don't commit)
-data/parquet/
-data/dollar_bars/
-data/volume_profiles/
-data/l1/
-data/l2/
-data/
+# Data (large files — keep locally, not src/data/)
+/data/
 *.csv
 
 # Tuning results (large, machine-specific)
