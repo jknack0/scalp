@@ -111,6 +111,26 @@ class DatabentoFeed(BaseFeed):
         if self._loop:
             self._loop.call_soon_threadsafe(self._stop_event.set)
 
+    async def _heartbeat(self) -> None:
+        """Log feed stats every 30 seconds so we know it's alive."""
+        last_count = 0
+        while self._running:
+            await asyncio.sleep(30)
+            if not self._running:
+                break
+            delta = self._tick_count - last_count
+            last_count = self._tick_count
+            stale_sec = time.monotonic() - self._last_tick_time
+            stats = self.latency_stats
+            logger.info(
+                "feed_heartbeat",
+                total_ticks=self._tick_count,
+                ticks_30s=delta,
+                stale_sec=round(stale_sec, 1),
+                avg_latency_ms=round(stats["avg_ms"], 1),
+                p99_latency_ms=round(stats["p99_ms"], 1),
+            )
+
     async def run(self) -> None:
         """Main loop: connect, subscribe, stream ticks via callback."""
         self._running = True
@@ -119,6 +139,8 @@ class DatabentoFeed(BaseFeed):
         symbol = self._config.symbol
         logger.info("feed_starting", symbol=symbol)
 
+        heartbeat_task: asyncio.Task | None = None
+
         try:
             await self.connect()
             await self.subscribe(symbol)
@@ -126,18 +148,31 @@ class DatabentoFeed(BaseFeed):
             # Use callback API — Databento calls our function from its own thread
             self._client.add_callback(self._on_record, self._on_error)
 
-            # Start the client (begins receiving data)
+            # Start heartbeat logging
+            heartbeat_task = asyncio.create_task(self._heartbeat(), name="feed_heartbeat")
+
+            # Start the client (begins receiving data — blocks in executor)
+            logger.info("feed_client_starting")
             await self._loop.run_in_executor(None, self._client.start)
 
-            # Block until stop() is called
+            # If start() returns, the session ended or connection was lost
+            logger.warning(
+                "feed_client_returned",
+                tick_count=self._tick_count,
+                hint="client.start() returned — connection may have dropped",
+            )
+
+            # Block until stop() is called (callbacks may still fire on reconnect)
             await self._stop_event.wait()
 
         except asyncio.CancelledError:
             logger.info("feed_cancelled")
         except Exception as e:
             if self._running:
-                logger.error("feed_error", error=str(e))
+                logger.error("feed_error", error=str(e), error_type=type(e).__name__)
         finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
             await self.disconnect()
             logger.info("feed_stopped", tick_count=self._tick_count)
 

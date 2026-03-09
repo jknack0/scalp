@@ -64,6 +64,7 @@ class TickAggregator:
         self._interval = interval_seconds
         self._bar = _BarAccumulator()
         self._running = False
+        self._bar_count = 0
 
     async def on_tick(self, tick: TickEvent) -> None:
         """Accumulate a tick into the current bar."""
@@ -143,5 +144,19 @@ class TickAggregator:
             aggressive_sell_vol=float(bar.sell_vol),
         )
 
+        self._bar_count += 1
+        # Log every 12th bar (~once per minute with 5s bars)
+        if self._bar_count % 12 == 1:
+            logger.info(
+                "bar_emitted",
+                bar_num=self._bar_count,
+                bar_type=bar_type,
+                open=round(bar_event.open, 2),
+                close=round(bar_event.close, 2),
+                volume=bar_event.volume,
+                ticks=bar.tick_count,
+                buy_vol=bar.buy_vol,
+                sell_vol=bar.sell_vol,
+            )
         await self._bus.publish(bar_event)
         self._bar = _BarAccumulator()
