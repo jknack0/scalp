@@ -20,17 +20,13 @@ from src.backtesting.engine import BacktestConfig, BacktestEngine
 from src.backtesting.metrics import BacktestResult
 from src.features.feature_hub import FeatureHub
 from src.strategies.base import StrategyBase
-from src.strategies.cvd_divergence_strategy import CVDDivergenceConfig, CVDDivergenceStrategy
 from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-from src.strategies.vol_regime_strategy import VolRegimeConfig, VolRegimeStrategy
 from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
 
 
 STRATEGY_MAP = {
     "orb": (ORBConfig, ORBStrategy),
     "vwap": (VWAPConfig, VWAPStrategy),
-    "cvd": (CVDDivergenceConfig, CVDDivergenceStrategy),
-    "vol_regime": (VolRegimeConfig, VolRegimeStrategy),
 }
 
 

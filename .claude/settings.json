@@ -13,7 +13,27 @@
       "Bash(grep -c \"from src.backtesting import.*PendingOrder\\\\|PendingOrder\" /c/Dev/scalp/**/*.py)",
       "Bash(grep -E \"^\\\\s{2}[A-Z]|^={2,}|^-{2,}|^\\\\s{4}\")",
       "Bash(grep -E \"^\\\\s{2}|^={2,}\")",
-      "Bash(tasklist)"
+      "Bash(tasklist)",
+      "Read(//c/Users/Jonk/AppData/Local/Temp/claude/c--Dev-scalp/tasks/**)",
+      "Bash(wmic process where \"ProcessId=64488\" get CommandLine /format:list)",
+      "Bash(wmic process where \"ProcessId=58272\" get CommandLine /format:list)",
+      "Bash(wmic process where \"ProcessId=64488\" get WorkingSetSize,KernelModeTime,UserModeTime /format:list)",
+      "Bash(du -sh data/*/)",
+      "Bash(uv python list --installed)",
+      "Bash(uv python install 3.13)",
+      "Bash(tasklist //FI \"IMAGENAME eq python.exe\")",
+      "Bash(wmic OS get TotalVisibleMemorySize /value)",
+      "Bash(powershell -c \"\\(Get-CimInstance Win32_ComputerSystem\\).TotalPhysicalMemory / 1GB\")",
+      "Bash(taskkill //F //IM python.exe)",
+      "Read(//mnt/c/Dev/**)",
+      "Bash(uv add tzdata)",
+      "Bash(wmic process where \"name=''python.exe'' or name=''python3.exe''\" get processid,commandline)",
+      "Bash(wmic cpu get Name,NumberOfCores,NumberOfLogicalProcessors)",
+      "Bash(powershell -Command \"\\(Get-ChildItem -Recurse ''C:\\\\Dev\\\\scalp\\\\data\\\\parquet_1m'' | Measure-Object -Property Length -Sum\\).Sum / 1MB\")",
+      "Bash(.venv/Scripts/python -c \"from src.strategies.iceberg_strategy import IcebergStrategy, IcebergStrategyConfig; print\\(''Strategy OK''\\); from src.backtesting.l2_replay import L2ReplayEngine, L2ReplayConfig; print\\(''Engine OK''\\)\")",
+      "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
+      "Bash(taskkill /PID 3832 /F)",
+      "Bash(cmd //c \"taskkill /PID 3832 /F\")"
     ]
   }
 }

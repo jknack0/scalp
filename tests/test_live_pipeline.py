@@ -320,7 +320,7 @@ class TestSpreadGate:
         from src.models.hmm_regime import RegimeState
 
         signal = Signal(
-            strategy_id="test", direction=Direction.LONG,
+            strategy_id="orb", direction=Direction.LONG,
             entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
             signal_time=datetime.now(), expiry_time=datetime.now(),
             confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
@@ -329,7 +329,7 @@ class TestSpreadGate:
 
         await handler._process_signal(signal, bar)
 
-        # Should NOT have submitted — position still 0
+        # Should NOT have submitted — spread filter blocks ORB
         assert oms.position == 0
 
     async def test_spread_gate_passes_during_normal_spread(self):

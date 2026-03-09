@@ -26,12 +26,10 @@ from src.backtesting.metrics import BacktestMetrics
 from src.features.feature_hub import FeatureHub
 from src.filters.spread_monitor import SpreadConfig, SpreadMonitor
 from src.filters.vpin_monitor import VPINConfig, VPINMonitor
-from src.strategies.cvd_divergence_strategy import CVDDivergenceConfig, CVDDivergenceStrategy
 from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-from src.strategies.vol_regime_strategy import VolRegimeConfig, VolRegimeStrategy
 from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
 
-STRATEGIES = ["orb", "vwap", "cvd", "vol_regime"]
+STRATEGIES = ["orb", "vwap"]
 
 
 def _parse_args():
@@ -54,20 +52,6 @@ def _make_strategy(name: str):
             VWAPConfig(
                 reversion_hmm_states=[],
                 pullback_hmm_states=[],
-                min_confidence=0.3,
-            ),
-            hub,
-        )
-    elif name == "cvd":
-        return CVDDivergenceStrategy(
-            CVDDivergenceConfig(require_hmm_states=[], min_confidence=0.3),
-            hub,
-        )
-    elif name == "vol_regime":
-        return VolRegimeStrategy(
-            VolRegimeConfig(
-                high_vol_hmm_states=[],
-                low_vol_hmm_states=[],
                 min_confidence=0.3,
             ),
             hub,

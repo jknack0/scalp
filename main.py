@@ -22,7 +22,6 @@ from src.core.session import SessionManager
 from src.core.signal_handler import SignalHandler
 from src.core.tick_aggregator import TickAggregator
 from src.filters.spread_monitor import SpreadConfig, SpreadMonitor
-from src.filters.vpin_monitor import VPINConfig, VPINMonitor
 from src.feeds.tradovate import TradovateFeed
 from src.features.feature_hub import FeatureHub
 from src.monitoring.health import HealthMonitor
@@ -49,26 +48,37 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_strategies(names: list[str] | None) -> list:
-    """Instantiate requested strategies with fresh FeatureHubs."""
+    """Instantiate requested strategies with tuned configs."""
     from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-
-    available = {
-        "orb": (ORBConfig, ORBStrategy),
-    }
+    from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
 
     if names is None:
-        names = ["orb"]  # Default to ORB for now
+        names = ["orb", "vwap"]
 
     strategies = []
     for name in names:
         name = name.lower()
-        if name not in available:
-            print(f"Unknown strategy: {name}. Available: {', '.join(available)}")
-            sys.exit(1)
-        config_cls, strategy_cls = available[name]
         hub = FeatureHub()
-        cfg = config_cls()
-        strategies.append(strategy_cls(cfg, hub))
+        if name == "orb":
+            cfg = ORBConfig(
+                require_hmm_states=[], min_confidence=0.0,
+                target_multiplier=1.0, volume_multiplier=1.5,
+                max_signal_time="10:30", expiry_minutes=60,
+                require_vwap_alignment=True, max_signals_per_day=1,
+            )
+            strategies.append(ORBStrategy(cfg, hub))
+        elif name == "vwap":
+            cfg = VWAPConfig(
+                reversion_hmm_states=[], pullback_hmm_states=[],
+                min_confidence=0.3, entry_sd_reversion=1.5,
+                stop_sd=2.0, pullback_entry_sd=0.5,
+                mode_cooldown_bars=5, max_signals_per_day=4,
+                expiry_minutes=30,
+            )
+            strategies.append(VWAPStrategy(cfg, hub))
+        else:
+            print(f"Unknown strategy: {name}. Available: orb, vwap")
+            sys.exit(1)
 
     return strategies
 
@@ -112,14 +122,11 @@ async def main() -> None:
     strategy_names = [s.config.strategy_id for s in strategies]
     logger.info("strategies_loaded", strategies=strategy_names)
 
-    # ── Spread filter (hard gate) ───────────────────────────
-    spread_monitor = SpreadMonitor(config=SpreadConfig())
-
-    # ── VPIN regime filter ────────────────────────────────────
-    vpin_monitor = VPINMonitor(config=VPINConfig())
+    # ── Spread filter (ORB only — hurts VWAP) ───────────────
+    spread_monitor = SpreadMonitor(config=SpreadConfig(z_threshold=2.0))
 
     # ── Signal handler (strategies -> risk -> OMS) ────────────
-    handler = SignalHandler(bus, strategies, risk, oms, spread_monitor=spread_monitor, vpin_monitor=vpin_monitor)
+    handler = SignalHandler(bus, strategies, risk, oms, spread_monitor=spread_monitor)
     handler.wire()
 
     # ── Tick aggregator (ticks → bars) ───────────────────────

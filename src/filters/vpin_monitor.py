@@ -7,8 +7,7 @@ or "undefined" based on configurable thresholds.
 
 Gating logic:
 - VWAP strategy blocked in "trending" regime
-- ORB and CVD strategies blocked in "mean_reversion" regime
-- VolRegime strategy: no VPIN gate (handles its own regime)
+- ORB strategy blocked in "mean_reversion" regime
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ Regime = Literal["mean_reversion", "trending", "undefined"]
 
 # Strategies that should be blocked in each regime
 BLOCKED_IN_TRENDING: frozenset[str] = frozenset({"vwap_reversion"})
-BLOCKED_IN_MEAN_REVERSION: frozenset[str] = frozenset({"orb", "cvd_divergence"})
+BLOCKED_IN_MEAN_REVERSION: frozenset[str] = frozenset({"orb"})
 
 
 @dataclass(frozen=True)
@@ -74,10 +73,29 @@ class VPINMonitor:
         self._pending: list[VPINState] = []
         self._flush_count: int = 0
         self._last_timestamp: datetime | None = None
+        self._last_date: object | None = None  # track date for daily reset
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def reset_session(self) -> None:
+        """Clear buckets and state for a new trading session."""
+        self._buy_vol = 0.0
+        self._sell_vol = 0.0
+        self._bucket_imbalances.clear()
+        self._prev_price = None
+        self._latest_state = None
+
+    def _check_daily_reset(self, timestamp: datetime | None) -> None:
+        """Reset buckets when the date changes."""
+        if timestamp is None:
+            return
+        d = timestamp.date() if hasattr(timestamp, 'date') else None
+        if d is not None and self._last_date is not None and d != self._last_date:
+            self.reset_session()
+        if d is not None:
+            self._last_date = d
 
     def on_tick(self, price: float, size: int, bid: float, ask: float, timestamp: datetime | None = None) -> None:
         """Classify a trade and accumulate into the current volume bucket.
@@ -88,6 +106,7 @@ class VPINMonitor:
         - mid-spread -> tick rule
         """
         if timestamp is not None:
+            self._check_daily_reset(timestamp)
             self._last_timestamp = timestamp
 
         # Classify aggressor
@@ -126,6 +145,34 @@ class VPINMonitor:
             self._sell_vol = overflow * (1 - buy_ratio)
             total = self._buy_vol + self._sell_vol
 
+    def on_bar_l1(self, buy_vol: float, sell_vol: float, timestamp: datetime | None = None) -> None:
+        """Feed VPIN with actual L1 trade-classified volumes (no estimation)."""
+        if timestamp is not None:
+            self._check_daily_reset(timestamp)
+            self._last_timestamp = timestamp
+
+        if buy_vol + sell_vol <= 0:
+            return
+
+        self._buy_vol += buy_vol
+        self._sell_vol += sell_vol
+
+        # Check if bucket is full
+        total = self._buy_vol + self._sell_vol
+        while total >= self.config.bucket_size:
+            overflow = total - self.config.bucket_size
+            if total > 0:
+                buy_ratio = self._buy_vol / total
+            else:
+                buy_ratio = 0.5
+            bucket_buy = self.config.bucket_size * buy_ratio
+            bucket_sell = self.config.bucket_size * (1 - buy_ratio)
+            self._complete_bucket(bucket_buy, bucket_sell)
+
+            self._buy_vol = overflow * buy_ratio
+            self._sell_vol = overflow * (1 - buy_ratio)
+            total = self._buy_vol + self._sell_vol
+
     def on_bar_approx(self, open_: float, close: float, volume: int, timestamp: datetime | None = None,
                        high: float | None = None, low: float | None = None) -> None:
         """Approximate VPIN from bar data (backtesting fallback).
@@ -135,6 +182,7 @@ class VPINMonitor:
         available. Falls back to binary classification if only open/close.
         """
         if timestamp is not None:
+            self._check_daily_reset(timestamp)
             self._last_timestamp = timestamp
 
         if volume <= 0:

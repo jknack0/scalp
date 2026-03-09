@@ -30,8 +30,14 @@ from src.backtesting.metrics import (
 from src.backtesting.slippage import SlippageResult, VolatilitySlippageModel
 from src.core.events import BarEvent
 from src.core.logging import get_logger
+from src.filters import L2Snapshot
+from src.filters.depth_monitor import DepthConfig, DepthMonitor
+from src.filters.hidden_liquidity import HiddenLiquidityConfig, HiddenLiquidityDetector, HiddenLiquidityMap
+from src.filters.iceberg_absorption import AbsorptionDetector, IcebergConfig, IcebergDetector, TradeEvent, infer_aggressor
+from src.filters.mid_momentum import MidMomentumMonitor, MidSnapshot, MomentumConfig
 from src.filters.spread_monitor import SpreadConfig, SpreadMonitor, SpreadSnapshot
 from src.filters.vpin_monitor import VPINConfig, VPINMonitor
+from src.filters.weighted_mid import WeightedMidConfig, WeightedMidMonitor, WeightedMidSnapshot
 from src.strategies.base import Direction, Signal, StrategyBase
 
 logger = get_logger("backtest")
@@ -90,6 +96,17 @@ class BacktestConfig:
     hmm_model_path: str = "models/hmm/v1"
     spread_monitor: SpreadMonitor | None = None
     vpin_monitor: VPINMonitor | None = None
+    prebuilt_bars: pl.DataFrame | None = None  # Skip data loading if bars already aggregated
+    # L2 filters (require l2_parquet_dir or prebuilt_l2)
+    l2_parquet_dir: str | None = None  # Path to L2 snapshot Parquet files
+    prebuilt_l2: pl.DataFrame | None = None  # Pre-loaded L2 snapshots
+    depth_monitor: DepthMonitor | None = None
+    weighted_mid_monitor: WeightedMidMonitor | None = None
+    mid_momentum_monitor: MidMomentumMonitor | None = None
+    iceberg_detector: IcebergDetector | None = None
+    absorption_detector: AbsorptionDetector | None = None
+    hidden_liquidity_detector: HiddenLiquidityDetector | None = None
+    hidden_liquidity_map: HiddenLiquidityMap | None = None
 
 
 @dataclass
@@ -400,7 +417,7 @@ class BacktestEngine:
         Returns:
             BacktestResult with trades, equity curve, daily P&L, metrics.
         """
-        bars_df = self._load_bars(config)
+        bars_df = config.prebuilt_bars if config.prebuilt_bars is not None else self._load_bars(config)
         if bars_df.is_empty():
             logger.warning("no_bars_loaded", start=str(config.start_date), end=str(config.end_date))
             metrics, eq, dp = MetricsCalculator.from_trades([], config.initial_capital)
@@ -408,6 +425,19 @@ class BacktestEngine:
                 trades=[], equity_curve=eq, daily_pnl=dp,
                 metrics=metrics, config_summary=self._config_summary(config),
             )
+
+        # ── Load L2 data if any L2 filters are active ──
+        l2_snapshots: list[tuple[int, L2Snapshot]] = []  # (timestamp_ns, snapshot)
+        has_l2_filters = any([
+            config.depth_monitor, config.weighted_mid_monitor,
+            config.mid_momentum_monitor, config.iceberg_detector,
+            config.absorption_detector, config.hidden_liquidity_detector,
+        ])
+        if has_l2_filters:
+            l2_df = config.prebuilt_l2 if config.prebuilt_l2 is not None else self._load_l2(config)
+            if l2_df is not None and not l2_df.is_empty():
+                l2_snapshots = self._build_l2_index(l2_df)
+        l2_idx = 0  # pointer into l2_snapshots for time-aligned iteration
 
         # ── Vectorized preprocessing (replaces per-row Python work) ──
         # Convert naive-UTC timestamps to US/Eastern and compute epoch ns
@@ -496,28 +526,78 @@ class BacktestEngine:
                 timestamp_ns=row["_timestamp_ns"],
                 avg_bid_size=float(row.get("avg_bid_size", 0.0) or 0.0),
                 avg_ask_size=float(row.get("avg_ask_size", 0.0) or 0.0),
+                avg_bid_price=float(row.get("avg_bid_price", 0.0) or 0.0),
+                avg_ask_price=float(row.get("avg_ask_price", 0.0) or 0.0),
                 aggressive_buy_vol=float(row.get("aggressive_buy_vol", 0.0) or 0.0),
                 aggressive_sell_vol=float(row.get("aggressive_sell_vol", 0.0) or 0.0),
             )
 
             # Feed filters with bar data
-            if config.spread_monitor and bar_event.avg_bid_size > 0 and bar_event.avg_ask_size > 0:
+            # Use avg_bid/ask_price (from enriched bars) for spread monitor
+            if config.spread_monitor and bar_event.avg_bid_price > 0 and bar_event.avg_ask_price > 0:
                 snap = SpreadSnapshot(
                     timestamp=bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time,
-                    bid=bar_event.avg_bid_size,
-                    ask=bar_event.avg_ask_size,
+                    bid=bar_event.avg_bid_price,
+                    ask=bar_event.avg_ask_price,
                 )
                 config.spread_monitor.push_sync(snap)
 
             if config.vpin_monitor and bar_event.volume > 0:
-                config.vpin_monitor.on_bar_approx(
-                    open_=bar_event.open,
-                    close=bar_event.close,
-                    volume=bar_event.volume,
-                    timestamp=bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time,
-                    high=bar_event.high,
-                    low=bar_event.low,
-                )
+                naive_ts = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+                # Use actual L1 trade classification when available, fall back to BVC
+                if bar_event.aggressive_buy_vol > 0 or bar_event.aggressive_sell_vol > 0:
+                    config.vpin_monitor.on_bar_l1(
+                        buy_vol=bar_event.aggressive_buy_vol,
+                        sell_vol=bar_event.aggressive_sell_vol,
+                        timestamp=naive_ts,
+                    )
+                else:
+                    config.vpin_monitor.on_bar_approx(
+                        open_=bar_event.open,
+                        close=bar_event.close,
+                        volume=bar_event.volume,
+                        timestamp=naive_ts,
+                        high=bar_event.high,
+                        low=bar_event.low,
+                    )
+
+            # Feed L2 filters with time-aligned snapshots
+            if has_l2_filters and l2_snapshots:
+                bar_ns = row["_timestamp_ns"]
+                naive_ts = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+                # Advance L2 pointer to latest snapshot at or before this bar
+                while l2_idx < len(l2_snapshots) - 1 and l2_snapshots[l2_idx + 1][0] <= bar_ns:
+                    l2_idx += 1
+                if l2_idx < len(l2_snapshots) and l2_snapshots[l2_idx][0] <= bar_ns:
+                    l2_snap = l2_snapshots[l2_idx][1]
+                    if config.depth_monitor:
+                        config.depth_monitor.push_sync(l2_snap)
+                    if config.weighted_mid_monitor and l2_snap.bids and l2_snap.asks:
+                        wm_snap = WeightedMidSnapshot(
+                            timestamp=naive_ts,
+                            bid=l2_snap.bids[0][0], ask=l2_snap.asks[0][0],
+                            bid_size_top=l2_snap.bids[0][1], ask_size_top=l2_snap.asks[0][1],
+                        )
+                        config.weighted_mid_monitor.push_sync(wm_snap)
+                    if config.mid_momentum_monitor and l2_snap.bids and l2_snap.asks:
+                        mid_snap = MidSnapshot(
+                            timestamp=naive_ts,
+                            bid=l2_snap.bids[0][0], ask=l2_snap.asks[0][0],
+                        )
+                        config.mid_momentum_monitor.push_sync(mid_snap)
+                    if config.iceberg_detector:
+                        config.iceberg_detector.push_l2(l2_snap)
+                    if config.absorption_detector:
+                        config.absorption_detector.push_l2(l2_snap)
+                    if config.hidden_liquidity_detector:
+                        config.hidden_liquidity_detector.update_book(l2_snap)
+                        # Check trades at bar close for hidden liquidity
+                        if config.hidden_liquidity_map and bar_event.volume > 0:
+                            evt = config.hidden_liquidity_detector.check_trade(
+                                bar_event.close, int(bar_event.volume), naive_ts)
+                            if evt:
+                                config.hidden_liquidity_map.record_hidden_event(
+                                    evt.price, evt.size, evt.timestamp)
 
             # Feed bar to each strategy and detect new signals
             for strat in config.strategies:
@@ -538,6 +618,29 @@ class BacktestEngine:
                             if config.vpin_monitor:
                                 vpin_blocked, _ = config.vpin_monitor.should_block(sig.strategy_id)
                                 if vpin_blocked:
+                                    continue
+                            # L2 filter gates
+                            if config.depth_monitor:
+                                trade_side = "ask" if sig.direction == Direction.LONG else "bid"
+                                if config.depth_monitor.is_thinning(trade_side):
+                                    continue
+                            if config.weighted_mid_monitor:
+                                wm_sig = config.weighted_mid_monitor.latest_signal
+                                if wm_sig:
+                                    if sig.direction == Direction.LONG and wm_sig.lean == "down":
+                                        continue
+                                    if sig.direction == Direction.SHORT and wm_sig.lean == "up":
+                                        continue
+                            if config.mid_momentum_monitor:
+                                mom_sig = config.mid_momentum_monitor.latest_signal
+                                if mom_sig:
+                                    if sig.direction == Direction.LONG and mom_sig.direction == "down":
+                                        continue
+                                    if sig.direction == Direction.SHORT and mom_sig.direction == "up":
+                                        continue
+                            if config.absorption_detector:
+                                abs_sigs = config.absorption_detector.push_l2(l2_snapshots[l2_idx][1]) if l2_snapshots and l2_idx < len(l2_snapshots) else []
+                                if any(s.status == "absorbing" for s in abs_sigs):
                                     continue
                             oms.on_signal(sig, bar_index)
 
@@ -703,6 +806,85 @@ class BacktestEngine:
 
         logger.info("l1_bars_built", ticks=len(df), bars=len(bars), interval=interval)
         return bars
+
+    def _load_l2(self, config: BacktestConfig) -> pl.DataFrame | None:
+        """Load L2 snapshot Parquet files for the date range."""
+        import os
+
+        if not config.l2_parquet_dir:
+            return None
+
+        frames = []
+        parquet_dir = config.l2_parquet_dir
+        # Support flat directory or year-partitioned
+        if os.path.isdir(parquet_dir):
+            for f in sorted(os.listdir(parquet_dir)):
+                if f.endswith(".parquet"):
+                    frames.append(pl.read_parquet(os.path.join(parquet_dir, f)))
+
+        if not frames:
+            logger.warning("no_l2_data", dir=parquet_dir)
+            return None
+
+        df = pl.concat(frames)
+
+        # Filter to date range
+        if "timestamp" in df.columns:
+            if df["timestamp"].dtype == pl.Datetime("ns", "UTC") or df["timestamp"].dtype == pl.Datetime("us", "UTC"):
+                df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
+            start_dt = datetime.combine(config.start_date, time(0, 0))
+            end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
+            df = df.filter(
+                (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
+            )
+
+        return df.sort("timestamp") if not df.is_empty() else None
+
+    def _build_l2_index(self, l2_df: pl.DataFrame) -> list[tuple[int, L2Snapshot]]:
+        """Convert L2 DataFrame rows to time-indexed L2Snapshots.
+
+        Expected columns: timestamp, bid_px_1..10, bid_sz_1..10, ask_px_1..10, ask_sz_1..10.
+        Alternatively accepts ts_event (nanosecond epoch int) instead of timestamp.
+        """
+        # If ts_event column exists, use it directly (avoids naive datetime timezone issues)
+        has_ts_event = "ts_event" in l2_df.columns
+        result = []
+        for row in l2_df.iter_rows(named=True):
+            if has_ts_event:
+                ts_ns = int(row["ts_event"])
+            else:
+                ts = row["timestamp"]
+                if hasattr(ts, "timestamp"):
+                    # Treat naive datetimes as UTC to match bar timestamps
+                    import calendar
+                    ts_ns = int(calendar.timegm(ts.timetuple()) * 1_000_000_000)
+                    ts_ns += ts.microsecond * 1000
+                else:
+                    ts_ns = int(ts)
+
+            bids = []
+            asks = []
+            for i in range(1, 11):
+                bp = row.get(f"bid_px_{i}", 0.0)
+                bs = row.get(f"bid_sz_{i}", 0)
+                ap = row.get(f"ask_px_{i}", 0.0)
+                az = row.get(f"ask_sz_{i}", 0)
+                if bp and bs:
+                    bids.append((float(bp), int(bs)))
+                if ap and az:
+                    asks.append((float(ap), int(az)))
+
+            snap_ts = row.get("timestamp") if not has_ts_event else None
+            if snap_ts is None or not isinstance(snap_ts, datetime):
+                snap_ts = datetime.utcfromtimestamp(ts_ns / 1e9)
+            snap = L2Snapshot(
+                timestamp=snap_ts,
+                bids=bids,
+                asks=asks,
+            )
+            result.append((ts_ns, snap))
+
+        return result
 
     def _is_new_session(self, prev_date: date | None, current_date: date) -> bool:
         """Detect session boundary (new trading day)."""

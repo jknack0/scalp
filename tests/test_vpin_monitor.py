@@ -120,9 +120,6 @@ async def test_regime_gating_mean_reversion_blocks_orb():
         assert blocked_orb is True
         assert "mean_reversion" in reason
 
-        blocked_cvd, _ = mon.should_block("cvd_divergence")
-        assert blocked_cvd is True
-
         # VWAP should NOT be blocked
         blocked_vwap, _ = mon.should_block("vwap_reversion")
         assert blocked_vwap is False

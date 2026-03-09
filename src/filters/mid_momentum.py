@@ -133,6 +133,44 @@ class MidMomentumMonitor:
 
         return signal
 
+    def push_sync(self, snapshot: MidSnapshot) -> MomentumSignal:
+        """Synchronous push for backtesting (no Parquet persistence)."""
+        self._buffer.append(snapshot)
+        self._push_count += 1
+
+        window = min(len(self._buffer), self.config.regression_window)
+        mids = np.array([s.mid for s in list(self._buffer)[-window:]])
+
+        if window >= 2:
+            x = np.arange(window, dtype=np.float64)
+            slope = float(np.polyfit(x, mids, 1)[0])
+        else:
+            slope = 0.0
+
+        all_mids = np.array([s.mid for s in self._buffer])
+        std = float(np.std(all_mids, ddof=1)) if len(all_mids) > 1 else 0.0
+        drift_score = slope / std if std > 0 else 0.0
+
+        if abs(drift_score) < self.config.neutral_threshold:
+            direction: Literal["up", "down", "neutral"] = "neutral"
+        elif drift_score > 0:
+            direction = "up"
+        else:
+            direction = "down"
+
+        strength = min(abs(drift_score), 1.0)
+
+        signal = MomentumSignal(
+            timestamp=snapshot.timestamp,
+            mid=snapshot.mid,
+            slope=slope,
+            drift_score=drift_score,
+            direction=direction,
+            strength=strength,
+        )
+        self._latest_signal = signal
+        return signal
+
     @property
     def buffer_size(self) -> int:
         """Current number of mid observations in buffer."""

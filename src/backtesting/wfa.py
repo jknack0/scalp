@@ -34,9 +34,6 @@ _SESSION_END = time(16, 0)
 STRATEGY_MAP = {
     "orb": ("src.strategies.orb_strategy", "ORBConfig", "ORBStrategy"),
     "vwap": ("src.strategies.vwap_strategy", "VWAPConfig", "VWAPStrategy"),
-    "cvd": ("src.strategies.cvd_divergence_strategy", "CVDDivergenceConfig", "CVDDivergenceStrategy"),
-    "vol_regime": ("src.strategies.vol_regime_strategy", "VolRegimeConfig", "VolRegimeStrategy"),
-    "obi": ("src.strategies.obi_strategy", "OBIConfig", "OBIStrategy"),
 }
 
 

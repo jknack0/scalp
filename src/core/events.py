@@ -55,6 +55,8 @@ class BarEvent:
     # L1-enriched fields (0.0 when not available)
     avg_bid_size: float = 0.0
     avg_ask_size: float = 0.0
+    avg_bid_price: float = 0.0
+    avg_ask_price: float = 0.0
     aggressive_buy_vol: float = 0.0
     aggressive_sell_vol: float = 0.0
 

@@ -125,6 +125,39 @@ class WeightedMidMonitor:
 
         return signal
 
+    def push_sync(self, snapshot: WeightedMidSnapshot) -> WeightedMidSignal:
+        """Synchronous push for backtesting (no Parquet persistence)."""
+        self._push_count += 1
+
+        raw_mid = snapshot.raw_mid
+        weighted_mid = self._compute_weighted_mid(snapshot)
+        divergence = weighted_mid - raw_mid
+
+        self._divergences.append(divergence)
+
+        arr = np.array(self._divergences)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        z_score = (divergence - mean) / std if std > 0 else 0.0
+
+        if z_score > self.config.lean_threshold:
+            lean: Literal["up", "down", "neutral"] = "up"
+        elif z_score < -self.config.lean_threshold:
+            lean = "down"
+        else:
+            lean = "neutral"
+
+        signal = WeightedMidSignal(
+            timestamp=snapshot.timestamp,
+            raw_mid=raw_mid,
+            weighted_mid=weighted_mid,
+            divergence=divergence,
+            divergence_z_score=z_score,
+            lean=lean,
+        )
+        self._latest_signal = signal
+        return signal
+
     def get_vwap_anchor(self) -> float:
         """Return the best mid-price estimate for VWAP reversion anchoring.
 

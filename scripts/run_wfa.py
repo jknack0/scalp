@@ -19,17 +19,13 @@ from src.backtesting.engine import BacktestConfig
 from src.backtesting.wfa import WFAConfig, WFARunner
 from src.features.feature_hub import FeatureHub
 from src.strategies.base import StrategyBase
-from src.strategies.cvd_divergence_strategy import CVDDivergenceConfig, CVDDivergenceStrategy
 from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-from src.strategies.vol_regime_strategy import VolRegimeConfig, VolRegimeStrategy
 from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
 
 
 STRATEGY_MAP = {
     "orb": (ORBConfig, ORBStrategy),
     "vwap": (VWAPConfig, VWAPStrategy),
-    "cvd": (CVDDivergenceConfig, CVDDivergenceStrategy),
-    "vol_regime": (VolRegimeConfig, VolRegimeStrategy),
 }
 
 PARAM_GRIDS = {
@@ -40,14 +36,6 @@ PARAM_GRIDS = {
     "vwap": {
         "entry_sd_reversion": [1.8, 2.0, 2.2, 2.5],
         "flat_slope_threshold": [0.001, 0.002, 0.003, 0.005],
-    },
-    "cvd": {
-        "divergence_threshold_pct": [0.10, 0.15, 0.20, 0.25],
-        "poc_proximity_ticks": [4, 6, 8, 10],
-    },
-    "vol_regime": {
-        "pullback_bars": [2, 3, 4],
-        "high_vol_target_ticks": [6, 8, 10, 12],
     },
 }
 

@@ -40,9 +40,7 @@ from src.backtesting.dsr import DSRConfig, DeflatedSharpeCalculator
 from src.backtesting.engine import BacktestConfig
 from src.backtesting.wfa import WFAConfig, WFARunner
 from src.features.feature_hub import FeatureHub
-from src.strategies.cvd_divergence_strategy import CVDDivergenceConfig, CVDDivergenceStrategy
 from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-from src.strategies.vol_regime_strategy import VolRegimeConfig, VolRegimeStrategy
 from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
 
 # Force structlog configuration before any logger is created
@@ -53,8 +51,6 @@ configure_logging(log_level="WARNING" if _quiet else "INFO", log_file=None)
 STRATEGY_MAP = {
     "orb": (ORBConfig, ORBStrategy),
     "vwap": (VWAPConfig, VWAPStrategy),
-    "cvd": (CVDDivergenceConfig, CVDDivergenceStrategy),
-    "vol_regime": (VolRegimeConfig, VolRegimeStrategy),
 }
 
 from src.models.hmm_regime import RegimeState
@@ -92,22 +88,6 @@ PARAM_GRIDS = {
         "stop_sd": [2.5, 3.0, 3.5],                             # stop sizing
         "min_session_age_minutes": [10, 20],                     # time filter
         "reversion_hmm_states": _HMM_REVERSION_PRESETS,          # HMM regime (2)
-    },
-    # CVD: 3 × 3 × 2 × 2 × 3 = 108 combos
-    "cvd": {
-        "divergence_threshold_pct": [0.10, 0.15, 0.20],         # signal sensitivity
-        "target_ticks": [10, 14, 18],                            # target sizing
-        "stop_buffer_ticks": [1, 3],                             # stop sizing
-        "min_confidence": [0.5, 0.65],                           # confidence gate
-        "require_hmm_states": _HMM_BREAKOUT_PRESETS,             # HMM regime (3)
-    },
-    # Vol Regime: 3 × 3 × 2 × 2 × 3 = 108 combos
-    "vol_regime": {
-        "pullback_bars": [2, 3, 4],                              # entry timing
-        "high_vol_target_ticks": [6, 8, 12],                     # target sizing
-        "high_vol_stop_ticks": [2, 4],                           # stop sizing
-        "min_confidence": [0.5, 0.65],                           # confidence gate
-        "high_vol_hmm_states": _HMM_BREAKOUT_PRESETS,            # HMM regime (3)
     },
 }
 

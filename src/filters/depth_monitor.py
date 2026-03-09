@@ -124,6 +124,46 @@ class DepthMonitor:
 
         return signal
 
+    def push_sync(self, snapshot: L2Snapshot) -> DepthSignal:
+        """Synchronous push for backtesting (no Parquet persistence)."""
+        n = self.config.depth_levels
+        bid_depth = sum(size for _, size in snapshot.bids[:n])
+        ask_depth = sum(size for _, size in snapshot.asks[:n])
+
+        self._bid_depths.append(bid_depth)
+        self._ask_depths.append(ask_depth)
+        self._push_count += 1
+
+        bid_mean = float(np.mean(self._bid_depths))
+        ask_mean = float(np.mean(self._ask_depths))
+
+        bid_depth_ratio = bid_depth / bid_mean if bid_mean > 0 else 1.0
+        ask_depth_ratio = ask_depth / ask_mean if ask_mean > 0 else 1.0
+
+        has_baseline = len(self._bid_depths) >= self.config.min_samples
+        bid_thinning = has_baseline and bid_depth_ratio < self.config.thin_threshold
+        ask_thinning = has_baseline and ask_depth_ratio < self.config.thin_threshold
+
+        if ask_thinning and not bid_thinning:
+            breakout_lean: Literal["up", "down", "none"] = "up"
+        elif bid_thinning and not ask_thinning:
+            breakout_lean = "down"
+        else:
+            breakout_lean = "none"
+
+        signal = DepthSignal(
+            timestamp=snapshot.timestamp,
+            bid_depth=bid_depth,
+            ask_depth=ask_depth,
+            bid_depth_ratio=bid_depth_ratio,
+            ask_depth_ratio=ask_depth_ratio,
+            bid_thinning=bid_thinning,
+            ask_thinning=ask_thinning,
+            breakout_lean=breakout_lean,
+        )
+        self._latest_signal = signal
+        return signal
+
     def is_thinning(self, side: Literal["bid", "ask"]) -> bool:
         """Check whether the specified side of the book is thinning.
 

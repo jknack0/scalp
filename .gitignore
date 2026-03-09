@@ -21,6 +21,9 @@ data/l2/
 data/
 *.csv
 
+# Tuning results (large, machine-specific)
+results/
+
 # Trained model artifacts
 models/
 

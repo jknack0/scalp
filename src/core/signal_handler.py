@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 from src.core.events import BarEvent, EventBus, EventType, FillEvent, TickEvent
 from src.core.logging import get_logger
 from src.filters.spread_monitor import SpreadConfig, SpreadMonitor, SpreadSnapshot
-from src.filters.vpin_monitor import VPINMonitor
 from src.risk.risk_manager import RiskManager
 from src.strategies.base import Signal, StrategyBase
 
@@ -44,14 +43,12 @@ class SignalHandler:
         risk_manager: RiskManager,
         oms: TradovateOMS,
         spread_monitor: SpreadMonitor | None = None,
-        vpin_monitor: VPINMonitor | None = None,
     ) -> None:
         self._bus = event_bus
         self._strategies = strategies
         self._risk = risk_manager
         self._oms = oms
         self._spread = spread_monitor or SpreadMonitor()
-        self._vpin = vpin_monitor
 
         # Track pending paper positions for target/stop management
         self._paper_entries: list[_PaperPosition] = []
@@ -68,16 +65,7 @@ class SignalHandler:
         )
 
     async def on_tick(self, tick: TickEvent) -> None:
-        """Feed VPIN monitor and monitor open paper positions for target/stop hits."""
-        # Feed tick to VPIN monitor
-        if self._vpin is not None and tick.last_size > 0:
-            self._vpin.on_tick(
-                price=tick.last_price,
-                size=tick.last_size,
-                bid=tick.bid,
-                ask=tick.ask,
-            )
-
+        """Monitor open paper positions for target/stop hits."""
         if not self._oms.is_paper or not self._paper_entries:
             return
 
@@ -165,24 +153,14 @@ class SignalHandler:
 
     async def _process_signal(self, signal: Signal, bar: BarEvent) -> None:
         """Risk-check and submit a signal."""
-        # Hard gate: spread filter
-        spread_ok, spread_reason = self._spread.is_spread_normal()
-        if not spread_ok:
-            logger.info(
-                "signal_blocked_spread",
-                strategy=signal.strategy_id,
-                reason=spread_reason,
-            )
-            return
-
-        # Regime gate: VPIN filter
-        if self._vpin is not None:
-            vpin_blocked, vpin_reason = self._vpin.should_block(signal.strategy_id)
-            if vpin_blocked:
+        # Hard gate: spread filter (ORB only — hurts VWAP mean reversion)
+        if signal.strategy_id == "orb":
+            spread_ok, spread_reason = self._spread.is_spread_normal()
+            if not spread_ok:
                 logger.info(
-                    "signal_blocked_vpin",
+                    "signal_blocked_spread",
                     strategy=signal.strategy_id,
-                    reason=vpin_reason,
+                    reason=spread_reason,
                 )
                 return
 

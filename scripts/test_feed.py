@@ -25,11 +25,13 @@ from src.core.logging import configure_logging, get_logger
 from src.feeds.tradovate import TradovateFeed
 
 
-async def main(seconds: int, symbol: str) -> None:
+async def main(seconds: int, symbol: str, live: bool = False) -> None:
     configure_logging(log_level="INFO", log_file=None)
     logger = get_logger("test_feed")
 
     config = BotConfig.from_yaml()
+    if live:
+        config.tradovate_demo = False
     if not config.tradovate_username or not config.tradovate_password:
         logger.error("missing_credentials", hint="Set TRADOVATE_USERNAME and TRADOVATE_PASSWORD in .env")
         return
@@ -37,6 +39,8 @@ async def main(seconds: int, symbol: str) -> None:
     # Override symbol if specified
     if symbol:
         config = BotConfig.from_yaml(symbol=symbol)
+        if live:
+            config.tradovate_demo = False
 
     bus = EventBus()
     feed = TradovateFeed(event_bus=bus, config=config)
@@ -81,5 +85,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Tradovate live feed")
     parser.add_argument("--seconds", type=int, default=30, help="Run duration in seconds")
     parser.add_argument("--symbol", type=str, default="", help="Symbol to subscribe (default: from config)")
+    parser.add_argument("--live", action="store_true", help="Use live API instead of demo")
     args = parser.parse_args()
-    asyncio.run(main(args.seconds, args.symbol))
+    asyncio.run(main(args.seconds, args.symbol, live=args.live))
