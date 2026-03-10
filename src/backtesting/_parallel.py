@@ -136,38 +136,69 @@ def make_strategies(
     use_hmm: bool = False,
     hmm_model_path: str = "models/hmm/v1",
     hmm_classifier: object = None,
-) -> list[StrategyBase]:
+    yaml_path: str | None = None,
+) -> list:
     """Reconstruct strategy instances from dotted class paths.
 
     This is a module-level function so it can be pickled and sent to worker
-    processes.
+    processes.  Strategies take a dict config; params are merged into the
+    strategy-specific section (``orb`` or ``vwap``).
     """
-    from src.features.feature_hub import FeatureHub
-
-    mod_path_cfg, cls_name_cfg = config_cls_path.rsplit(".", 1)
-    config_cls = getattr(importlib.import_module(mod_path_cfg), cls_name_cfg)
+    import copy
 
     mod_path_strat, cls_name_strat = strategy_cls_path.rsplit(".", 1)
     strategy_cls = getattr(importlib.import_module(mod_path_strat), cls_name_strat)
 
-    cfg = config_cls()
-    if not use_hmm:
-        cfg.require_hmm_states = []
+    # Standalone strategies with YAML file
+    if yaml_path and hasattr(strategy_cls, "from_yaml"):
+        strat = strategy_cls.from_yaml(yaml_path)
+        if params:
+            for k, v in params.items():
+                setattr(strat, k, v)
+        return [strat]
+
+    # Build default dict config based on strategy class name
+    _default_configs = {
+        "ORBStrategy": {
+            "strategy": {"strategy_id": "orb", "max_signals_per_day": 1},
+            "orb": {"target_multiplier": 0.5, "volume_multiplier": 1.5,
+                    "max_signal_time": "10:30", "expiry_minutes": 60,
+                    "require_vwap_alignment": True},
+            "filter": {"min_score": 0, "require_direction_agreement": False, "signals": {}},
+            "exit": {"time_stop_minutes": 60},
+        },
+        "VWAPReversionStrategy": {
+            "strategy": {"strategy_id": "vwap_reversion", "max_signals_per_day": 4},
+            "vwap": {"entry_sd_reversion": 1.5, "stop_sd": 2.0,
+                     "pullback_entry_sd": 0.5, "mode_cooldown_bars": 5,
+                     "expiry_minutes": 30},
+            "filter": {"min_score": 0, "require_direction_agreement": False, "signals": {}},
+            "exit": {"target": "vwap", "stop_ticks": 8, "time_stop_minutes": 30},
+        },
+    }
+
+    config = copy.deepcopy(_default_configs.get(cls_name_strat, {}))
+
+    # Apply param overrides into the strategy-specific section
     if params:
-        for k, v in params.items():
-            setattr(cfg, k, v)
+        strat_key = "orb" if "orb" in config else "vwap" if "vwap" in config else None
+        if strat_key and strat_key in config:
+            for k, v in params.items():
+                config[strat_key][k] = v
 
-    # Use pre-loaded HMM classifier; fall back to loading from disk
-    _hmm = hmm_classifier
-    if use_hmm and _hmm is None:
-        from src.models.hmm_regime import HMMRegimeClassifier
-        try:
-            _hmm = HMMRegimeClassifier.load(hmm_model_path)
-        except Exception:
-            pass
+    # Regime detector for HMM gating
+    regime_detector = None
+    if use_hmm:
+        if hmm_classifier is not None:
+            regime_detector = hmm_classifier
+        else:
+            try:
+                from src.models.regime_detector import RegimeDetector
+                regime_detector = RegimeDetector.load(hmm_model_path)
+            except Exception:
+                pass
 
-    hub = FeatureHub()
-    return [strategy_cls(cfg, hub, hmm_classifier=_hmm)]
+    return [strategy_cls(config=config, regime_detector=regime_detector)]
 
 
 # ---------------------------------------------------------------------------

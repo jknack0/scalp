@@ -10,7 +10,7 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv*
 
 # Data (large files — keep locally, not src/data/)
 /data/

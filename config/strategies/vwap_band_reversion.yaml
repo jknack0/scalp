@@ -1,0 +1,74 @@
+# Strategy 1: VWAP Band Reversion with regime gating
+# Mean reversion to VWAP when price deviates >=2.5 SD during range-bound sessions.
+# All entry gates are declarative filters evaluated by FilterEngine.
+#
+# Tuned 2026-03-10 sweep (Dec 2024 - Feb 2025):
+#   13 trades, 62% WR, Sharpe 8.90, PF 3.90, $154 net
+
+strategy:
+  strategy_id: vwap_band_reversion
+  max_signals_per_day: 999
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [vwap_session, rsi_momentum, adx, atr, relative_volume, session_time, hmm_regime]
+signal_configs:
+  rsi_momentum:
+    period: 2
+    long_threshold: 30.0
+    short_threshold: 70.0
+  adx:
+    period: 14
+    threshold: 25.0
+  hmm_regime:
+    model_path: models/hmm/v2_5m
+    pass_states: [LOW_VOL_RANGE, MEAN_REVERSION]
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 9:45 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 585"
+  - signal: session_time
+    expr: "<= 900"
+  # VWAP must have stabilized (30+ bars into session)
+  - signal: vwap_session
+    field: session_age_bars
+    expr: ">= 30"
+  # VWAP slope must be flat (non-trending intraday)
+  - signal: vwap_session
+    field: slope
+    expr: "abs <= 0.5"
+  # Price must be >= 2.5 SD from VWAP
+  - signal: vwap_session
+    field: deviation_sd
+    expr: "abs >= 2.5"
+  # ADX must be below 25 (non-strongly-trending)
+  - signal: adx
+    expr: "< 25.0"
+  # Volume must be >= 0.5x average
+  - signal: relative_volume
+    expr: ">= 0.5"
+  # HMM regime: disabled for baseline test
+  # - signal: hmm_regime
+  #   expr: passes
+
+exit:
+  target:
+    type: vwap                # mean-revert to VWAP
+  stop:
+    type: atr_multiple        # 2.0 x ATR(14)
+    multiplier: 2.0
+  time_stop_minutes: 15       # tight time stop — take the bounce, don't overstay
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # VWAP slope accelerating against position = trend developing
+    - type: vwap_slope
+      threshold: 0.3

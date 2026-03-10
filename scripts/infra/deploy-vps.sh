@@ -129,13 +129,13 @@ step "Running smoke test"
 cd "$BOT_DIR"
 $UV_PATH run python -c "
 from src.core.config import BotConfig
-from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
-from src.filters.spread_monitor import SpreadConfig, SpreadMonitor
+from src.strategies.orb import ORBStrategy
+from src.strategies.vwap_reversion import VWAPReversionStrategy
+from src.filters.filter_engine import FilterEngine
 print('  Config loads: OK')
 print('  ORB strategy: OK')
 print('  VWAP strategy: OK')
-print('  Spread filter: OK')
+print('  FilterEngine: OK')
 "
 
 # ── 8. Summary ────────────────────────────────────────────────────────────

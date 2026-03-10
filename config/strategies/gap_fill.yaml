@@ -1,0 +1,42 @@
+# Strategy 2: Opening Gap Fill
+# Fades overnight gaps between 0.10-0.50% after the first 15-minute candle.
+# Research basis: 60-69% gap fill rate on ES, 80%+ fill by noon.
+
+strategy:
+  strategy_id: gap_fill
+  max_signals_per_day: 1
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+gap:
+  min_gap_pct: 0.10           # minimum gap size (% of prior close)
+  max_gap_pct: 0.50           # maximum gap size
+  ib_minutes: 15              # wait for first 15-min candle
+  adx_max: 25.0               # don't fade gaps in strong trends
+  noon_cutoff: true            # close by noon if unfilled
+
+signals: [adx, atr, session_time]
+signal_configs:
+  adx:
+    period: 14
+    threshold: 25.0
+
+filters:
+  # Only trade 9:45+ (after IB forms)
+  - signal: session_time
+    expr: ">= 585"
+    seq: 1
+
+exit:
+  target:
+    type: fixed_ticks          # computed dynamically (prior close)
+    ticks: 40                  # fallback, actual target is prior close
+  stop:
+    type: fixed_ticks
+    ticks: 16                  # fallback, actual stop computed from IB range
+  time_stop_minutes: 150       # noon cutoff (~2.5 hours from 9:45)

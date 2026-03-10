@@ -1,22 +1,19 @@
 """Tests for strategy base class and interfaces (src/strategies/base.py).
 
 Uses a MockStrategy to test the ABC's concrete methods: session gating,
-signal construction, HMM state filtering, daily limits, and HMMFeatureBuffer.
+signal construction, HMM state filtering, daily limits.
 """
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pytest
 
 from src.core.events import BarEvent
-from src.features.feature_hub import FeatureHub, FeatureHubConfig
 from src.models.hmm_regime import RegimeState
 from src.strategies.base import (
     TICK_SIZE,
     Direction,
-    HMMFeatureBuffer,
     Signal,
     StrategyBase,
     StrategyConfig,
@@ -128,9 +125,8 @@ class TestSignalIds:
 class TestSessionGating:
     def test_session_gating(self):
         """Active session allows signal, inactive blocks."""
-        hub = FeatureHub()
         config = _make_config()
-        strat = MockStrategy(config, hub)
+        strat = MockStrategy(config)
 
         # 10:30 ET — within session
         in_session = datetime(2025, 6, 2, 10, 30, tzinfo=_ET)
@@ -151,9 +147,8 @@ class TestSessionGating:
 class TestSignalCountLimit:
     def test_signal_count_limit(self):
         """Third signal blocked when max_signals_per_day=2."""
-        hub = FeatureHub()
         config = _make_config(max_signals_per_day=2)
-        strat = MockStrategy(config, hub)
+        strat = MockStrategy(config)
 
         in_session = datetime(2025, 6, 2, 10, 30, tzinfo=_ET)
 
@@ -170,50 +165,14 @@ class TestSignalCountLimit:
         assert strat.can_generate_signal(in_session) is False
 
 
-# ── Test 5: HMM feature buffer ──────────────────────────────────────
-
-
-class TestHMMFeatureBuffer:
-    def test_hmm_buffer_builds_matrix(self):
-        """Shape (50, 6), no NaN/inf after warmup."""
-        hub = FeatureHub()
-        buf = HMMFeatureBuffer(maxlen=300)
-
-        # Feed 100 bars to get enough data
-        base_price = 5000.0
-        rng = np.random.default_rng(42)
-
-        for i in range(100):
-            price = base_price + rng.normal(0, 1.0)
-            volume = int(100 + rng.integers(0, 50))
-            hub.on_bar(
-                timestamp_ns=i * 1_000_000_000,
-                open_=price - 0.25,
-                high=price + 0.50,
-                low=price - 0.50,
-                close=price,
-                volume=volume,
-            )
-            snap = hub.snapshot()
-            buf.update(snap, price)
-
-        assert buf.is_ready() is True
-        matrix = buf.build_matrix()
-        assert matrix is not None
-        assert matrix.shape == (50, 6)
-        assert not np.any(np.isnan(matrix))
-        assert not np.any(np.isinf(matrix))
-
-
-# ── Test 6: Reset clears daily state ────────────────────────────────
+# ── Test 5: Reset clears daily state ────────────────────────────────
 
 
 class TestReset:
     def test_reset_clears_daily_state(self):
         """signals_today=0 after reset."""
-        hub = FeatureHub()
         config = _make_config()
-        strat = MockStrategy(config, hub)
+        strat = MockStrategy(config)
 
         # Generate a signal
         s = strat.generate_signal()
@@ -226,17 +185,16 @@ class TestReset:
         assert len(strat._signals_generated) == 0
 
 
-# ── Test 7: HMM state gating ────────────────────────────────────────
+# ── Test 6: HMM state gating ────────────────────────────────────────
 
 
 class TestHMMStateGating:
     def test_hmm_state_gating(self):
         """require_hmm_states filters wrong states."""
-        hub = FeatureHub()
         config = _make_config(
             require_hmm_states=[RegimeState.BREAKOUT, RegimeState.HIGH_VOL_UP]
         )
-        strat = MockStrategy(config, hub)
+        strat = MockStrategy(config)
 
         in_session = datetime(2025, 6, 2, 10, 30, tzinfo=_ET)
 

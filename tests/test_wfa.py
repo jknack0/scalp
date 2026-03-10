@@ -142,25 +142,38 @@ class TestGenerateWindowsCoverage:
 class TestBestParamsSelected:
     def test_best_params_selected(self, monkeypatch):
         """Grid search picks the param combo with highest IS Sharpe."""
-        # Track which params produce which Sharpe
-        call_log: list[dict] = []
+        from src.backtesting.wfa import STRATEGY_MAP
+
+        # Register a fake strategy for testing
+        class FakeStrategy:
+            strategy_id = "fake"
+            target_multiplier = 0.5
+            volume_multiplier = 1.5
+            def on_bar(self, bar, bundle=None): return None
+            def reset(self): pass
+            @classmethod
+            def from_yaml(cls, path):
+                return cls()
+
+        monkeypatch.setitem(
+            STRATEGY_MAP, "fake",
+            ("tests.test_wfa", "FakeStrategy", "fake.yaml"),
+        )
+
+        def mock_make_strategy(self_runner, params):
+            strat = FakeStrategy()
+            for k, v in params.items():
+                setattr(strat, k, v)
+            return [strat]
 
         def mock_run_on_dates(self_runner, dates, bars_df, strategies):
-            # Extract the param values from the strategy config
             strat = strategies[0]
-            params = {
-                "target_multiplier": strat.config.target_multiplier,
-                "volume_multiplier": strat.config.volume_multiplier,
-            }
-            call_log.append(params)
-
-            # Make target_multiplier=0.7 clearly the best
-            sharpe = 2.0 if params["target_multiplier"] == 0.7 else 0.5
+            sharpe = 2.0 if strat.target_multiplier == 0.7 else 0.5
             return _make_backtest_result(sharpe)
 
+        monkeypatch.setattr(WFARunner, "_make_strategy", mock_make_strategy)
         monkeypatch.setattr(WFARunner, "_run_on_dates", mock_run_on_dates)
 
-        # Create a minimal runner
         from src.backtesting.engine import BacktestConfig
         config = BacktestConfig(
             strategies=[],
@@ -168,7 +181,7 @@ class TestBestParamsSelected:
             end_date=date(2023, 12, 31),
         )
         runner = WFARunner(
-            strategy_name="orb",
+            strategy_name="fake",
             param_grid={
                 "target_multiplier": [0.4, 0.5, 0.6, 0.7],
                 "volume_multiplier": [1.5],
@@ -176,11 +189,10 @@ class TestBestParamsSelected:
             backtest_config=config,
         )
 
-        days = _make_trading_days(105)  # enough for 1 cycle: 63 train + 21 test
+        days = _make_trading_days(105)
         train_dates = days[:63]
         test_dates = days[63:84]
 
-        # Need real bars_df stub
         bars_df = pl.DataFrame({
             "timestamp": pl.Series([], dtype=pl.Int64),
         })

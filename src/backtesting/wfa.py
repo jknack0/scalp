@@ -19,7 +19,6 @@ import polars as pl
 from src.backtesting.engine import BacktestConfig, BacktestEngine
 from src.backtesting.metrics import BacktestResult, MetricsCalculator
 from src.core.logging import get_logger
-from src.features.feature_hub import FeatureHub
 from src.strategies.base import StrategyBase
 
 logger = get_logger("wfa")
@@ -30,10 +29,11 @@ _ET = ZoneInfo("US/Eastern")
 _SESSION_START = time(9, 30)
 _SESSION_END = time(16, 0)
 
-# Strategy factory map — imported lazily to avoid circular imports
-STRATEGY_MAP = {
-    "orb": ("src.strategies.orb_strategy", "ORBConfig", "ORBStrategy"),
-    "vwap": ("src.strategies.vwap_strategy", "VWAPConfig", "VWAPStrategy"),
+# Strategy factory map — module path, class name, YAML config path
+STRATEGY_MAP: dict[str, tuple[str, str, str]] = {
+    "vwap_band": ("src.strategies.vwap_band_reversion", "VWAPBandReversionStrategy", "config/strategies/vwap_band_reversion.yaml"),
+    "gap": ("src.strategies.gap_fill", "GapFillStrategy", "config/strategies/gap_fill.yaml"),
+    "va": ("src.strategies.value_area_reversion", "ValueAreaReversionStrategy", "config/strategies/value_area_reversion.yaml"),
 }
 
 
@@ -349,29 +349,21 @@ class WFARunner:
             grid_results=len(combos),
         )
 
-    def _make_strategy(self, params: dict) -> list[StrategyBase]:
+    def _make_strategy(self, params: dict) -> list:
         """Create a fresh strategy instance with param overrides via setattr."""
         import importlib
 
-        module_path, config_cls_name, strategy_cls_name = STRATEGY_MAP[self._strategy_name]
+        module_path, cls_name, yaml_path = STRATEGY_MAP[self._strategy_name]
         mod = importlib.import_module(module_path)
-        config_cls = getattr(mod, config_cls_name)
-        strategy_cls = getattr(mod, strategy_cls_name)
+        strategy_cls = getattr(mod, cls_name)
 
-        config = config_cls()
-        if not getattr(self._config, "use_hmm", False):
-            config.require_hmm_states = []
+        strat = strategy_cls.from_yaml(yaml_path)
 
-        for param_name, value in params.items():
-            setattr(config, param_name, value)
+        # Apply param overrides
+        for k, v in params.items():
+            setattr(strat, k, v)
 
-        # Pass HMM classifier if available on template strategies
-        hmm_cls = None
-        if self._config.strategies:
-            hmm_cls = getattr(self._config.strategies[0], "hmm_classifier", None)
-
-        hub = FeatureHub()
-        return [strategy_cls(config, hub, hmm_classifier=hmm_cls)]
+        return [strat]
 
     def _run_on_dates(
         self,
@@ -487,9 +479,9 @@ def _wfa_cycle_worker(
         run_on_dates,
     )
 
-    module_path, config_cls_name, strategy_cls_name = STRATEGY_MAP[strategy_name]
-    config_cls_path = f"{module_path}.{config_cls_name}"
-    strategy_cls_path = f"{module_path}.{strategy_cls_name}"
+    module_path, cls_name, yaml_path = STRATEGY_MAP[strategy_name]
+    config_cls_path = f"{module_path}.{cls_name}"
+    strategy_cls_path = f"{module_path}.{cls_name}"
 
     param_names = list(param_grid.keys())
     param_values = list(param_grid.values())

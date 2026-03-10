@@ -5,13 +5,13 @@ from src.strategies.base import (
     TICK_SIZE,
     TICK_VALUE,
     Direction,
-    HMMFeatureBuffer,
     Signal,
     StrategyBase,
     StrategyConfig,
 )
-from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-from src.strategies.vwap_strategy import VWAPConfig, VWAPMode, VWAPStrategy
+from src.strategies.gap_fill import GapFillStrategy
+from src.strategies.value_area_reversion import ValueAreaReversionStrategy
+from src.strategies.vwap_band_reversion import VWAPBandReversionStrategy
 
 __all__ = [
     "TICK_SIZE",
@@ -20,11 +20,8 @@ __all__ = [
     "Direction",
     "Signal",
     "StrategyConfig",
-    "HMMFeatureBuffer",
     "StrategyBase",
-    "ORBConfig",
-    "ORBStrategy",
-    "VWAPConfig",
-    "VWAPMode",
-    "VWAPStrategy",
+    "GapFillStrategy",
+    "ValueAreaReversionStrategy",
+    "VWAPBandReversionStrategy",
 ]

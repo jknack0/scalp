@@ -2,6 +2,10 @@
 
 Places, monitors, and cancels orders via Tradovate REST API.
 Supports both live and paper trading modes.
+
+Paper mode mirrors the backtest SimulatedOMS bracket model:
+  Signal → PendingOrder (limit entry wait) → target/stop/expiry exits on tick
+This ensures paper results match backtest assumptions.
 """
 
 from __future__ import annotations
@@ -9,15 +13,17 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
 import aiohttp
 
 from src.core.config import BotConfig
-from src.core.events import EventBus, EventType, FillEvent
+from src.core.events import EventBus, EventType, FillEvent, TickEvent
 from src.core.logging import get_logger
 from src.feeds.tradovate import TradovateAuth
 from src.oms.base import BaseOMS
+from src.strategies.base import Direction, Signal
 
 logger = get_logger("oms.tradovate")
 
@@ -57,19 +63,18 @@ class ManagedOrder:
     stop_price: float = 0.0
     target_order_id: int | None = None
     stop_order_id: int | None = None
+    expiry_time: datetime | None = None
 
 
 class TradovateOMS(BaseOMS):
     """Tradovate REST-based order management.
 
     Supports two modes:
-    - paper=True: logs orders, simulates fills at entry price (no API calls)
+    - paper=True: bracket order simulation (limit entry, target/stop/expiry exits)
     - paper=False: submits real orders to Tradovate demo/live
 
-    Usage:
-        oms = TradovateOMS(bus, config, paper=True)
-        await oms.initialize()
-        order_id = await oms.place_order(...)
+    Paper mode works identically to BacktestEngine's SimulatedOMS:
+    Signal → pending limit entry → tick fills entry → tick monitors target/stop/expiry.
     """
 
     def __init__(
@@ -144,17 +149,17 @@ class TradovateOMS(BaseOMS):
     async def submit_order(self, signal) -> str:
         """Submit an order from a strategy Signal.
 
-        Adapts from Strategy Signal format to Tradovate order API.
+        Paper mode: queues a pending limit entry (filled on tick).
+        Live mode: submits market order + bracket to Tradovate.
         Returns a local order_id string.
         """
-        from src.strategies.base import Direction, Signal
-
         if isinstance(signal, Signal):
             direction = "Buy" if signal.direction == Direction.LONG else "Sell"
             price = signal.entry_price
             target = signal.target_price
             stop = signal.stop_price
             strategy_id = signal.strategy_id
+            expiry = signal.expiry_time
         else:
             # Legacy SignalEvent
             direction = signal.direction
@@ -162,6 +167,7 @@ class TradovateOMS(BaseOMS):
             target = 0.0
             stop = 0.0
             strategy_id = signal.strategy_id
+            expiry = None
 
         order_id = self._gen_id(strategy_id)
         order = ManagedOrder(
@@ -170,17 +176,165 @@ class TradovateOMS(BaseOMS):
             symbol=self._config.symbol,
             direction=direction,
             qty=1,
-            order_type="Market",
+            order_type="Limit" if self._paper else "Market",
             price=price,
             target_price=target,
             stop_price=stop,
+            expiry_time=expiry,
         )
         self._orders[order_id] = order
 
         if self._paper:
-            return await self._paper_fill(order)
+            # Don't fill immediately — wait for tick to reach entry price
+            order.status = OrderStatus.WORKING
+            logger.info(
+                "paper_order_pending",
+                order_id=order.order_id,
+                direction=order.direction,
+                entry=order.price,
+                target=order.target_price,
+                stop=order.stop_price,
+                expiry=str(order.expiry_time),
+                strategy=order.strategy_id,
+            )
+            return order_id
 
         return await self._live_submit(order)
+
+    async def on_tick(self, tick: TickEvent) -> None:
+        """Process a tick for paper bracket orders.
+
+        Mirrors SimulatedOMS behavior:
+        1. Pending entries: fill if tick reaches entry price (limit)
+        2. Open positions: exit if tick hits target/stop/expiry
+        """
+        if not self._paper:
+            return
+
+        price = tick.last_price
+        if price <= 0:
+            return
+
+        now = datetime.fromtimestamp(tick.timestamp_ns / 1e9)
+        closed_ids: list[str] = []
+
+        for oid, order in self._orders.items():
+            # --- Pending entry: check for limit fill ---
+            if order.status == OrderStatus.WORKING and order.fill_price == 0.0:
+                # Check expiry before fill
+                if order.expiry_time and now >= order.expiry_time:
+                    order.status = OrderStatus.EXPIRED
+                    closed_ids.append(oid)
+                    logger.info(
+                        "paper_entry_expired",
+                        order_id=oid,
+                        strategy=order.strategy_id,
+                    )
+                    continue
+
+                # Limit entry: fill when price reaches entry level
+                filled = False
+                if order.direction == "Buy" and price <= order.price:
+                    filled = True
+                elif order.direction == "Sell" and price >= order.price:
+                    filled = True
+
+                if filled:
+                    order.fill_price = order.price  # Limit fill, no slippage
+                    order.status = OrderStatus.FILLED
+                    delta = order.qty if order.direction == "Buy" else -order.qty
+                    self._position += delta
+
+                    logger.info(
+                        "paper_entry_fill",
+                        order_id=oid,
+                        direction=order.direction,
+                        fill_price=order.fill_price,
+                        target=order.target_price,
+                        stop=order.stop_price,
+                        position=self._position,
+                        strategy=order.strategy_id,
+                    )
+
+                    fill = FillEvent(
+                        order_id=oid,
+                        symbol=order.symbol,
+                        direction="BUY" if order.direction == "Buy" else "SELL",
+                        fill_price=order.fill_price,
+                        fill_size=order.qty,
+                        commission=COMMISSION_PER_SIDE,
+                        timestamp_ns=tick.timestamp_ns,
+                    )
+                    await self._bus.publish(fill)
+
+            # --- Open position: check target/stop/expiry ---
+            elif order.status == OrderStatus.FILLED and order.target_price > 0:
+                hit = False
+                exit_price = 0.0
+                exit_reason = ""
+
+                if order.direction == "Buy":
+                    if price >= order.target_price:
+                        exit_price = order.target_price
+                        exit_reason = "target"
+                        hit = True
+                    elif price <= order.stop_price:
+                        exit_price = order.stop_price
+                        exit_reason = "stop"
+                        hit = True
+                else:  # Sell
+                    if price <= order.target_price:
+                        exit_price = order.target_price
+                        exit_reason = "target"
+                        hit = True
+                    elif price >= order.stop_price:
+                        exit_price = order.stop_price
+                        exit_reason = "stop"
+                        hit = True
+
+                # Check expiry
+                if not hit and order.expiry_time and now >= order.expiry_time:
+                    exit_price = price  # Market exit at current price
+                    exit_reason = "expiry"
+                    hit = True
+
+                if hit:
+                    # Close position
+                    delta = -order.qty if order.direction == "Buy" else order.qty
+                    self._position += delta
+                    order.status = OrderStatus.CANCELLED  # Mark as done
+
+                    pnl = (exit_price - order.fill_price) if order.direction == "Buy" else (order.fill_price - exit_price)
+                    pnl_usd = pnl / TICK_SIZE * TICK_VALUE
+
+                    logger.info(
+                        "paper_exit",
+                        order_id=oid,
+                        strategy=order.strategy_id,
+                        direction=order.direction,
+                        entry=order.fill_price,
+                        exit=exit_price,
+                        reason=exit_reason,
+                        pnl_ticks=pnl / TICK_SIZE,
+                        pnl_usd=round(pnl_usd, 2),
+                    )
+
+                    exit_dir = "SELL" if order.direction == "Buy" else "BUY"
+                    fill = FillEvent(
+                        order_id=f"{oid}-exit",
+                        symbol=order.symbol,
+                        direction=exit_dir,
+                        fill_price=exit_price,
+                        fill_size=order.qty,
+                        commission=COMMISSION_PER_SIDE,
+                        timestamp_ns=tick.timestamp_ns,
+                    )
+                    await self._bus.publish(fill)
+                    closed_ids.append(oid)
+
+        # Clean up closed orders
+        for oid in closed_ids:
+            self._orders.pop(oid, None)
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending order."""
@@ -260,6 +414,11 @@ class TradovateOMS(BaseOMS):
         logger.info("flattening", direction=direction, qty=qty)
 
         if self._paper:
+            # Close all open paper positions
+            for oid, order in list(self._orders.items()):
+                if order.status == OrderStatus.FILLED:
+                    order.status = OrderStatus.CANCELLED
+                    self._orders.pop(oid, None)
             self._position = 0
             logger.info("flattened", mode="PAPER")
             return
@@ -294,6 +453,22 @@ class TradovateOMS(BaseOMS):
             await self._session.close()
         await self._auth.close()
 
+    @property
+    def pending_entry_count(self) -> int:
+        """Number of pending entry orders (not yet filled)."""
+        return sum(
+            1 for o in self._orders.values()
+            if o.status == OrderStatus.WORKING and o.fill_price == 0.0
+        )
+
+    @property
+    def open_position_count(self) -> int:
+        """Number of open bracket positions being monitored."""
+        return sum(
+            1 for o in self._orders.values()
+            if o.status == OrderStatus.FILLED and o.target_price > 0
+        )
+
     # ── Internal ─────────────────────────────────────────────
 
     def _gen_id(self, strategy_id: str) -> str:
@@ -309,40 +484,6 @@ class TradovateOMS(BaseOMS):
             )
         else:
             self._session.headers.update({"Authorization": f"Bearer {token}"})
-
-    async def _paper_fill(self, order: ManagedOrder) -> str:
-        """Simulate an immediate fill for paper trading."""
-        order.status = OrderStatus.FILLED
-        order.fill_price = order.price
-
-        # Update position
-        delta = order.qty if order.direction == "Buy" else -order.qty
-        self._position += delta
-
-        logger.info(
-            "paper_fill",
-            order_id=order.order_id,
-            direction=order.direction,
-            price=order.price,
-            target=order.target_price,
-            stop=order.stop_price,
-            position=self._position,
-            strategy=order.strategy_id,
-        )
-
-        # Emit fill event
-        fill = FillEvent(
-            order_id=order.order_id,
-            symbol=order.symbol,
-            direction="BUY" if order.direction == "Buy" else "SELL",
-            fill_price=order.price,
-            fill_size=order.qty,
-            commission=COMMISSION_PER_SIDE,
-            timestamp_ns=time.time_ns(),
-        )
-        await self._bus.publish(fill)
-
-        return order.order_id
 
     async def _live_submit(self, order: ManagedOrder) -> str:
         """Submit a real order to Tradovate."""
@@ -458,5 +599,5 @@ class TradovateOMS(BaseOMS):
     def active_orders(self) -> list[ManagedOrder]:
         return [
             o for o in self._orders.values()
-            if o.status in (OrderStatus.PENDING, OrderStatus.WORKING)
+            if o.status in (OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.FILLED)
         ]

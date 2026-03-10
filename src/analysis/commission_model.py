@@ -129,10 +129,10 @@ class BrokerComparison:
 # ── Pre-built broker configurations ──────────────────────────────────────────
 
 def tradovate_free() -> CostModel:
-    """Tradovate Free plan — $0.35/side all-in."""
+    """Tradovate Free plan — $0.295/side ($0.59 round trip)."""
     return CostModel(
         broker_name="Tradovate Free",
-        broker_commission_per_side=0.35,
+        broker_commission_per_side=0.295,
     )
 
 

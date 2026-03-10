@@ -1,0 +1,46 @@
+# Strategy 3: Value Area Reversion (80% Rule)
+# When price opens outside prior session's Value Area and re-enters,
+# ~70% probability it traverses the full VA.
+# Research basis: 18 months of independent tracking on ES.
+
+strategy:
+  strategy_id: value_area_reversion
+  max_signals_per_day: 1
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+value_area:
+  confirmation_minutes: 60    # 2× 30-min periods of acceptance inside VA
+  price_step: 0.25            # MES tick size for volume profile
+  adx_max: 20.0               # balanced market only
+  stop_buffer_ticks: 4        # ticks beyond VA boundary for stop
+  min_va_width: 5.0           # minimum VA width in points
+
+signals: [adx, atr, session_time]
+signal_configs:
+  adx:
+    period: 14
+    threshold: 20.0
+
+filters:
+  # Active 9:45-2:00 PM (VA setups typically trigger 1-2 hours into session)
+  - signal: session_time
+    expr: ">= 585"
+    seq: 1
+  - signal: session_time
+    expr: "<= 840"
+    seq: 1
+
+exit:
+  target:
+    type: fixed_ticks          # fallback; actual target is POC/VA edge
+    ticks: 40
+  stop:
+    type: fixed_ticks          # fallback; actual stop is VA boundary
+    ticks: 16
+  time_stop_minutes: 120

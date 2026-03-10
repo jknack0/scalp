@@ -34,7 +34,22 @@
       "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
       "Bash(taskkill /PID 3832 /F)",
       "Bash(cmd //c \"taskkill /PID 3832 /F\")",
-      "WebFetch(domain:community.tradovate.com)"
+      "WebFetch(domain:community.tradovate.com)",
+      "Read(//c/Dev/src/strategies/**)",
+      "Bash(while read f)",
+      "Bash(do echo \"  $f\")",
+      "Bash(done)",
+      "Bash(.venv/bin/python scripts/tune/strategy.py --strategy orb)",
+      "Bash(.venv/Scripts/python.exe scripts/tune/strategy.py --strategy orb)",
+      "Bash(timeout 30 tail -f C:/Users/Jonk/AppData/Local/Temp/claude/c--Dev-scalp/tasks/bxtyx07f5.output)",
+      "Read(//c/Dev/scalp/Local/Temp/claude/c--Dev-scalp/**)",
+      "Bash(wmic process:*)",
+      "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/src --include=*.py)",
+      "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/tests --include=*.py)",
+      "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/scripts --include=*.py)"
+    ],
+    "additionalDirectories": [
+      "C:\\Dev\\scalp\\.venv"
     ]
   }
 }

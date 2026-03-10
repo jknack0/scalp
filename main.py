@@ -3,7 +3,6 @@
 Modes:
     python main.py              # Paper trading (default)
     python main.py --live       # Live trading (Tradovate demo account)
-    python main.py --strategy orb  # Run only ORB strategy
 """
 
 import argparse
@@ -21,10 +20,8 @@ from src.core.logging import configure_logging, get_logger
 from src.core.session import SessionManager
 from src.core.signal_handler import SignalHandler
 from src.core.tick_aggregator import TickAggregator
-from src.filters.spread_monitor import SpreadConfig, SpreadMonitor
 from src.feeds.databento_feed import DatabentoFeed
 from src.feeds.tradovate import TradovateFeed
-from src.features.feature_hub import FeatureHub
 from src.monitoring.health import HealthMonitor
 from src.oms.fill_monitor import FillMonitor
 from src.oms.tradovate_oms import TradovateOMS
@@ -39,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy", nargs="*", default=None,
-        help="Strategy names to run (default: all). Options: orb",
+        help="Strategy names to run (default: all). Options: vwap_band, gap, va",
     )
     parser.add_argument(
         "--bar-interval", type=float, default=1.0,
@@ -49,36 +46,25 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_strategies(names: list[str] | None) -> list:
-    """Instantiate requested strategies with tuned configs."""
-    from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-    from src.strategies.vwap_strategy import VWAPConfig, VWAPStrategy
+    """Instantiate requested strategies from YAML configs."""
+    from src.strategies.vwap_band_reversion import VWAPBandReversionStrategy
+    from src.strategies.gap_fill import GapFillStrategy
+    from src.strategies.value_area_reversion import ValueAreaReversionStrategy
 
     if names is None:
-        names = ["orb", "vwap"]
+        names = ["vwap_band", "gap", "va"]
 
     strategies = []
     for name in names:
         name = name.lower()
-        hub = FeatureHub()
-        if name == "orb":
-            cfg = ORBConfig(
-                require_hmm_states=[], min_confidence=0.0,
-                target_multiplier=1.0, volume_multiplier=1.5,
-                max_signal_time="10:30", expiry_minutes=60,
-                require_vwap_alignment=True, max_signals_per_day=1,
-            )
-            strategies.append(ORBStrategy(cfg, hub))
-        elif name == "vwap":
-            cfg = VWAPConfig(
-                reversion_hmm_states=[], pullback_hmm_states=[],
-                min_confidence=0.3, entry_sd_reversion=1.5,
-                stop_sd=2.0, pullback_entry_sd=0.5,
-                mode_cooldown_bars=5, max_signals_per_day=4,
-                expiry_minutes=30,
-            )
-            strategies.append(VWAPStrategy(cfg, hub))
+        if name == "vwap_band":
+            strategies.append(VWAPBandReversionStrategy.from_yaml("config/strategies/vwap_band_reversion.yaml"))
+        elif name == "gap":
+            strategies.append(GapFillStrategy.from_yaml("config/strategies/gap_fill.yaml"))
+        elif name == "va":
+            strategies.append(ValueAreaReversionStrategy.from_yaml("config/strategies/value_area_reversion.yaml"))
         else:
-            print(f"Unknown strategy: {name}. Available: orb, vwap")
+            print(f"Unknown strategy: {name}. Available: vwap_band, gap, va")
             sys.exit(1)
 
     return strategies
@@ -120,14 +106,29 @@ async def main() -> None:
 
     # ── Strategies ───────────────────────────────────────────
     strategies = _build_strategies(args.strategy)
-    strategy_names = [s.config.strategy_id for s in strategies]
+    strategy_names = [s.strategy_id for s in strategies]
     logger.info("strategies_loaded", strategies=strategy_names)
 
-    # ── Spread filter (ORB only — hurts VWAP) ───────────────
-    spread_monitor = SpreadMonitor(config=SpreadConfig(z_threshold=2.0))
+    # ── Signal + Filter engines (loaded from strategy YAML) ───
+    from config.loader import build_filter_engine, build_signal_engine, load_strategy_config
+    from src.signals.signal_bundle import SignalEngine
+    # Use first strategy's YAML for signal/filter config
+    strategy_yaml_map = {
+        "vwap_band": "vwap_band_reversion",
+        "gap": "gap_fill",
+        "va": "value_area_reversion",
+    }
+    first_strat = (args.strategy or ["vwap_band"])[0].lower()
+    yaml_cfg = load_strategy_config(strategy_yaml_map.get(first_strat, first_strat))
+    signal_engine = build_signal_engine(yaml_cfg)
+    filter_engine = build_filter_engine(yaml_cfg)
 
     # ── Signal handler (strategies -> risk -> OMS) ────────────
-    handler = SignalHandler(bus, strategies, risk, oms, spread_monitor=spread_monitor)
+    handler = SignalHandler(
+        bus, strategies, risk, oms,
+        signal_engine=signal_engine,
+        filter_engine=filter_engine,
+    )
     handler.wire()
 
     # ── Tick aggregator (ticks → bars) ───────────────────────

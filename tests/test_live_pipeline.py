@@ -10,8 +10,6 @@ import time
 from src.core.events import BarEvent, EventBus, EventType, FillEvent, TickEvent
 from src.core.signal_handler import SignalHandler
 from src.core.tick_aggregator import TickAggregator
-from src.features.feature_hub import FeatureHub
-from src.filters.spread_monitor import SpreadConfig, SpreadMonitor, SpreadSnapshot
 from src.oms.tradovate_oms import TradovateOMS, OrderStatus
 from src.risk.risk_manager import RiskManager
 
@@ -117,7 +115,8 @@ class TestTickAggregator:
 
 
 class TestPaperOMS:
-    async def test_paper_fill_emits_event(self):
+    async def test_paper_entry_pending_then_tick_fills(self):
+        """Submit order → pending entry → tick at entry price → filled."""
         bus = EventBus()
         oms = _make_paper_oms(bus)
         await oms.initialize()
@@ -131,7 +130,7 @@ class TestPaperOMS:
 
         from src.strategies.base import Direction, Signal
         from src.models.hmm_regime import RegimeState
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         signal = Signal(
             strategy_id="test",
@@ -140,11 +139,19 @@ class TestPaperOMS:
             target_price=5002.0,
             stop_price=4998.0,
             signal_time=datetime.now(),
-            expiry_time=datetime.now(),
+            expiry_time=datetime.now() + timedelta(minutes=60),
             confidence=0.8,
             regime_state=RegimeState.LOW_VOL_RANGE,
         )
         order_id = await oms.submit_order(signal)
+
+        # Not filled yet — waiting for tick at entry price
+        assert oms.position == 0
+        order = oms.get_order(order_id)
+        assert order.status == OrderStatus.WORKING
+
+        # Tick at entry price triggers fill
+        await oms.on_tick(_make_tick(price=5000.0))
 
         # Drain bus
         event = bus._queue.get_nowait()
@@ -155,34 +162,99 @@ class TestPaperOMS:
         assert fills[0].direction == "BUY"
         assert oms.position == 1
 
-    async def test_paper_position_tracking(self):
+    async def test_paper_bracket_target_exit(self):
+        """Filled position exits on target tick."""
+        bus = EventBus()
+        oms = _make_paper_oms(bus)
+        await oms.initialize()
+
+        fills = []
+
+        async def capture_fill(f: FillEvent):
+            fills.append(f)
+
+        bus.subscribe(EventType.FILL, capture_fill)
+
+        from src.strategies.base import Direction, Signal
+        from src.models.hmm_regime import RegimeState
+        from datetime import datetime, timedelta
+
+        sig = Signal(
+            strategy_id="test", direction=Direction.LONG,
+            entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
+            signal_time=datetime.now(),
+            expiry_time=datetime.now() + timedelta(minutes=60),
+            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
+        )
+        await oms.submit_order(sig)
+
+        # Fill entry
+        await oms.on_tick(_make_tick(price=5000.0))
+        assert oms.position == 1
+
+        # Hit target
+        await oms.on_tick(_make_tick(price=5002.0))
+        assert oms.position == 0
+
+        # Drain fills (entry + exit)
+        while not bus._queue.empty():
+            event = bus._queue.get_nowait()
+            await capture_fill(event)
+
+        assert len(fills) == 2
+        assert fills[1].fill_price == 5002.0
+        assert fills[1].direction == "SELL"
+
+    async def test_paper_bracket_stop_exit(self):
+        """Filled position exits on stop tick."""
         bus = EventBus()
         oms = _make_paper_oms(bus)
         await oms.initialize()
 
         from src.strategies.base import Direction, Signal
         from src.models.hmm_regime import RegimeState
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
-        # Long
         sig = Signal(
-            strategy_id="test", direction=Direction.LONG,
-            entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
-            signal_time=datetime.now(), expiry_time=datetime.now(),
+            strategy_id="test", direction=Direction.SHORT,
+            entry_price=5000.0, target_price=4998.0, stop_price=5002.0,
+            signal_time=datetime.now(),
+            expiry_time=datetime.now() + timedelta(minutes=60),
             confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
         )
         await oms.submit_order(sig)
-        assert oms.position == 1
 
-        # Short to flatten
-        sig2 = Signal(
-            strategy_id="test", direction=Direction.SHORT,
-            entry_price=5001.0, target_price=4999.0, stop_price=5003.0,
-            signal_time=datetime.now(), expiry_time=datetime.now(),
+        # Fill entry (price at or above entry for short)
+        await oms.on_tick(_make_tick(price=5000.0))
+        assert oms.position == -1
+
+        # Hit stop
+        await oms.on_tick(_make_tick(price=5002.0))
+        assert oms.position == 0
+
+    async def test_paper_expiry_cancels_unfilled_entry(self):
+        """Unfilled entry expires when tick arrives after expiry time."""
+        bus = EventBus()
+        oms = _make_paper_oms(bus)
+        await oms.initialize()
+
+        from src.strategies.base import Direction, Signal
+        from src.models.hmm_regime import RegimeState
+        from datetime import datetime, timedelta
+
+        sig = Signal(
+            strategy_id="test", direction=Direction.LONG,
+            entry_price=4990.0, target_price=4992.0, stop_price=4988.0,
+            signal_time=datetime.now(),
+            expiry_time=datetime.now() - timedelta(seconds=1),  # Already expired
             confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
         )
-        await oms.submit_order(sig2)
+        oid = await oms.submit_order(sig)
+
+        # Tick arrives — entry should expire, not fill
+        await oms.on_tick(_make_tick(price=4990.0))
         assert oms.position == 0
+        assert oms.get_order(oid) is None  # Cleaned up
 
     async def test_cancel_paper_order(self):
         bus = EventBus()
@@ -191,18 +263,22 @@ class TestPaperOMS:
 
         from src.strategies.base import Direction, Signal
         from src.models.hmm_regime import RegimeState
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         sig = Signal(
             strategy_id="test", direction=Direction.LONG,
             entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
-            signal_time=datetime.now(), expiry_time=datetime.now(),
+            signal_time=datetime.now(),
+            expiry_time=datetime.now() + timedelta(minutes=60),
             confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
         )
         oid = await oms.submit_order(sig)
-        # Paper fills are instant, so status is already FILLED
         order = oms.get_order(oid)
-        assert order.status == OrderStatus.FILLED
+        assert order.status == OrderStatus.WORKING
+
+        result = await oms.cancel_order(oid)
+        assert result is True
+        assert order.status == OrderStatus.CANCELLED
 
 
 # ── SignalHandler Tests ─────────────────────────────────────────
@@ -215,11 +291,7 @@ class TestSignalHandler:
         await oms.initialize()
         risk = RiskManager(max_signals_per_day=0)  # Block all signals
 
-        from src.strategies.orb_strategy import ORBConfig, ORBStrategy
-        hub = FeatureHub()
-        strat = ORBStrategy(ORBConfig(), hub)
-
-        handler = SignalHandler(bus, [strat], risk, oms)
+        handler = SignalHandler(bus, [], risk, oms)
         handler.wire()
 
         # No signals should get through
@@ -291,112 +363,5 @@ class TestEndToEnd:
 
 
 # ── Spread Gate Tests ─────────────────────────────────────────
-
-
-class TestSpreadGate:
-    async def test_spread_gate_blocks_during_anomalous_spread(self):
-        """Signal should be blocked when spread is anomalously wide."""
-        bus = EventBus()
-        oms = _make_paper_oms(bus)
-        await oms.initialize()
-        risk = RiskManager()
-
-        # Build a spread monitor with low min_samples and prime with stable data
-        config = SpreadConfig(z_threshold=2.0, min_samples=5)
-        spread_mon = SpreadMonitor(config=config)
-        from datetime import datetime, timezone
-        for _ in range(50):
-            await spread_mon.push(SpreadSnapshot(
-                timestamp=datetime.now(timezone.utc), bid=5000.0, ask=5000.25,
-            ))
-        # Now inject a massive spike so next check fails
-        await spread_mon.push(SpreadSnapshot(
-            timestamp=datetime.now(timezone.utc), bid=5000.0, ask=5010.0,
-        ))
-
-        handler = SignalHandler(bus, [], risk, oms, spread_monitor=spread_mon)
-
-        from src.strategies.base import Direction, Signal
-        from src.models.hmm_regime import RegimeState
-
-        signal = Signal(
-            strategy_id="orb", direction=Direction.LONG,
-            entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
-            signal_time=datetime.now(), expiry_time=datetime.now(),
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
-        )
-        bar = _make_bar(close=5000.0)
-
-        await handler._process_signal(signal, bar)
-
-        # Should NOT have submitted — spread filter blocks ORB
-        assert oms.position == 0
-
-    async def test_spread_gate_passes_during_normal_spread(self):
-        """Signal should pass through when spread is normal."""
-        bus = EventBus()
-        oms = _make_paper_oms(bus)
-        await oms.initialize()
-        risk = RiskManager()
-
-        config = SpreadConfig(z_threshold=2.0, min_samples=5)
-        spread_mon = SpreadMonitor(config=config)
-        from datetime import datetime, timezone
-        for _ in range(50):
-            await spread_mon.push(SpreadSnapshot(
-                timestamp=datetime.now(timezone.utc), bid=5000.0, ask=5000.25,
-            ))
-
-        handler = SignalHandler(bus, [], risk, oms, spread_monitor=spread_mon)
-        handler.wire()
-
-        from src.strategies.base import Direction, Signal
-        from src.models.hmm_regime import RegimeState
-
-        signal = Signal(
-            strategy_id="test", direction=Direction.LONG,
-            entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
-            signal_time=datetime.now(), expiry_time=datetime.now(),
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
-        )
-        bar = _make_bar(close=5000.0)
-
-        await handler._process_signal(signal, bar)
-
-        # Should have submitted — position is 1
-        assert oms.position == 1
-
-    async def test_spread_gate_allows_before_min_samples(self):
-        """Spread gate should not block before min_samples are collected."""
-        bus = EventBus()
-        oms = _make_paper_oms(bus)
-        await oms.initialize()
-        risk = RiskManager()
-
-        config = SpreadConfig(z_threshold=2.0, min_samples=100)
-        spread_mon = SpreadMonitor(config=config)
-        from datetime import datetime, timezone
-        # Push only 5 samples (well below min_samples=100)
-        for _ in range(5):
-            await spread_mon.push(SpreadSnapshot(
-                timestamp=datetime.now(timezone.utc), bid=5000.0, ask=5000.25,
-            ))
-
-        handler = SignalHandler(bus, [], risk, oms, spread_monitor=spread_mon)
-        handler.wire()
-
-        from src.strategies.base import Direction, Signal
-        from src.models.hmm_regime import RegimeState
-
-        signal = Signal(
-            strategy_id="test", direction=Direction.LONG,
-            entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
-            signal_time=datetime.now(), expiry_time=datetime.now(),
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
-        )
-        bar = _make_bar(close=5000.0)
-
-        await handler._process_signal(signal, bar)
-
-        # Should pass — not enough data to filter
-        assert oms.position == 1
+# Spread filtering now handled by FilterEngine (declarative YAML rules).
+# See tests/test_filter_engine.py for filter evaluation tests.

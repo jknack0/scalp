@@ -14,7 +14,6 @@ from src.backtesting.engine import SimulatedOMS, TICK_SIZE, TICK_VALUE, POINT_VA
 from src.backtesting.metrics import MetricsCalculator, Trade
 from src.backtesting.slippage import VolatilitySlippageModel
 from src.core.events import BarEvent
-from src.features.feature_hub import FeatureHub
 from src.strategies.base import Direction, Signal, StrategyBase, StrategyConfig
 
 from zoneinfo import ZoneInfo

@@ -4,9 +4,8 @@ Feeds historical 1s bars to strategies, simulates order fills against
 bar OHLC, and computes performance metrics. Synchronous — no asyncio needed.
 
 Signal-to-fill pipeline:
-1. strategy.on_bar(bar_event) — may append to _signals_generated
-2. Engine detects new signals via len(_signals_generated) diff
-3. New signals → oms.on_signal() creates PendingOrder
+1. strategy.on_bar(bar_event) → Signal | None (strategies own their filters)
+2. Non-None signals → oms.on_signal() creates PendingOrder
 4. Entry: next bar+ where price reaches entry_price (limit, no slippage)
 5. Exit: target (limit, no slippage), stop (market, slippage applied)
 6. Ambiguity: if both stop and target in same bar → stop hit first
@@ -30,14 +29,8 @@ from src.backtesting.metrics import (
 from src.backtesting.slippage import SlippageResult, VolatilitySlippageModel
 from src.core.events import BarEvent
 from src.core.logging import get_logger
-from src.filters import L2Snapshot
-from src.filters.depth_monitor import DepthConfig, DepthMonitor
-from src.filters.hidden_liquidity import HiddenLiquidityConfig, HiddenLiquidityDetector, HiddenLiquidityMap
-from src.filters.iceberg_absorption import AbsorptionDetector, IcebergConfig, IcebergDetector, TradeEvent, infer_aggressor
-from src.filters.mid_momentum import MidMomentumMonitor, MidSnapshot, MomentumConfig
-from src.filters.spread_monitor import SpreadConfig, SpreadMonitor, SpreadSnapshot
-from src.filters.vpin_monitor import VPINConfig, VPINMonitor
-from src.filters.weighted_mid import WeightedMidConfig, WeightedMidMonitor, WeightedMidSnapshot
+from src.filters.filter_engine import FilterEngine
+from src.signals.signal_bundle import EMPTY_BUNDLE, SignalBundle, SignalEngine
 from src.strategies.base import Direction, Signal, StrategyBase
 
 logger = get_logger("backtest")
@@ -58,6 +51,15 @@ def _run_coro(coro):
     return asyncio.run(coro)
 
 
+def _get_strategy_id(strategy) -> str:
+    """Extract strategy_id from either StrategyBase or standalone strategy."""
+    if hasattr(strategy, "config") and hasattr(strategy.config, "strategy_id"):
+        return strategy.config.strategy_id
+    if hasattr(strategy, "strategy_id"):
+        return strategy.strategy_id
+    return type(strategy).__name__
+
+
 # MES constants
 TICK_SIZE = 0.25
 TICK_VALUE = 1.25
@@ -73,7 +75,7 @@ _ET = ZoneInfo("US/Eastern")
 class BacktestConfig:
     """Configuration for a backtest run."""
 
-    strategies: list[StrategyBase]
+    strategies: list  # StrategyBase or standalone strategies (duck-typed)
     start_date: date
     end_date: date
     initial_capital: float = 10_000.0
@@ -88,25 +90,23 @@ class BacktestConfig:
     session_end: time = field(default_factory=lambda: time(16, 0))
     max_position: int = 1
     parquet_dir: str = "data/parquet"
+    dollar_threshold: float | None = None  # Set to build dollar bars (e.g. 50_000 for MES VWAP)
     l1_parquet_dir: str | None = None  # Set to "data/l1" to use L1 tick data for OBI enrichment
     l1_bar_seconds: int = 5  # Bar aggregation interval when using L1 data
     use_rth_bars: bool = False  # True = pre-built RTH bars, skip resample + session filter
     rth_parquet_dir: str = "data/parquet_5s_rth"
     use_hmm: bool = False
     hmm_model_path: str = "models/hmm/v1"
-    spread_monitor: SpreadMonitor | None = None
-    vpin_monitor: VPINMonitor | None = None
     prebuilt_bars: pl.DataFrame | None = None  # Skip data loading if bars already aggregated
-    # L2 filters (require l2_parquet_dir or prebuilt_l2)
-    l2_parquet_dir: str | None = None  # Path to L2 snapshot Parquet files
-    prebuilt_l2: pl.DataFrame | None = None  # Pre-loaded L2 snapshots
-    depth_monitor: DepthMonitor | None = None
-    weighted_mid_monitor: WeightedMidMonitor | None = None
-    mid_momentum_monitor: MidMomentumMonitor | None = None
-    iceberg_detector: IcebergDetector | None = None
-    absorption_detector: AbsorptionDetector | None = None
-    hidden_liquidity_detector: HiddenLiquidityDetector | None = None
-    hidden_liquidity_map: HiddenLiquidityMap | None = None
+    # Signal/Filter engine (declarative pipeline)
+    signal_engine: SignalEngine | None = None
+    filter_engine: FilterEngine | None = None
+    prebuilt_bundles: list | None = None  # Pre-computed SignalBundles indexed by bar position
+    enriched_signal_names: list[str] | None = None  # Signal names for inline bundle construction from sig_* columns
+    # Multi-timeframe filter support: map seq -> prebuilt SignalBundle list
+    # seq=1 uses signal_engine/prebuilt_bundles above.
+    # Higher seqs supply their own pre-computed bundles (e.g. 15m signals for seq=2).
+    filter_stage_bundles: dict[int, list] | None = None  # {2: [bundle_0, bundle_1, ...]}
 
 
 @dataclass
@@ -185,8 +185,13 @@ class SimulatedOMS:
         bar_time: datetime,
         bar_date: date,
         current_atr_ticks: float,
+        early_exit_fn=None,
     ) -> list[Trade]:
         """Process a bar: check for entry fills on pending, exit fills on open.
+
+        Args:
+            early_exit_fn: Optional callback (order, bar, bar_index) -> str | None.
+                If it returns a non-None string, that's the early exit reason.
 
         Returns:
             List of completed trades (may be empty).
@@ -231,7 +236,8 @@ class SimulatedOMS:
             # --- Open positions: check exits ---
             if order.status == "open":
                 trade = self._check_exit(
-                    order, bar, bar_index, bar_time, bar_date, current_atr_ticks
+                    order, bar, bar_index, bar_time, bar_date, current_atr_ticks,
+                    early_exit_fn=early_exit_fn,
                 )
                 if trade is not None:
                     completed.append(trade)
@@ -248,9 +254,11 @@ class SimulatedOMS:
         bar_time: datetime,
         bar_date: date,
         current_atr_ticks: float,
+        early_exit_fn=None,
     ) -> Trade | None:
         """Check if an open position should be exited on this bar.
 
+        Priority: stop > target > early_exit > expiry.
         Ambiguity rule: if both stop and target are within the bar's range,
         assume stop hit first (conservative).
         """
@@ -282,6 +290,15 @@ class SimulatedOMS:
                 order, bar_index, bar_time, bar_date, current_atr_ticks,
                 reason="target", use_slippage=False,
             )
+
+        # Early exit conditions (OR logic — any condition triggers market exit)
+        if early_exit_fn is not None:
+            early_reason = early_exit_fn(order, bar, bar_index)
+            if early_reason is not None:
+                return self._fill_exit(
+                    order, bar_index, bar_time, bar_date, current_atr_ticks,
+                    reason=early_reason, use_slippage=True, market_price=bar.close,
+                )
 
         # Check expiry on open positions
         if bar_time >= order.expiry_time:
@@ -417,6 +434,20 @@ class BacktestEngine:
         Returns:
             BacktestResult with trades, equity curve, daily P&L, metrics.
         """
+        # Auto-detect L1 data need: if signal engine requires L1 fields
+        # and l1_parquet_dir isn't set, check if data/l1 exists
+        if (
+            config.signal_engine is not None
+            and config.signal_engine.requires_l1
+            and config.l1_parquet_dir is None
+            and config.prebuilt_bars is None
+        ):
+            import os
+            default_l1 = "data/l1"
+            if os.path.isdir(default_l1):
+                logger.info("auto_l1_detected", reason="signal_engine requires L1 fields", dir=default_l1)
+                config.l1_parquet_dir = default_l1
+
         bars_df = config.prebuilt_bars if config.prebuilt_bars is not None else self._load_bars(config)
         if bars_df.is_empty():
             logger.warning("no_bars_loaded", start=str(config.start_date), end=str(config.end_date))
@@ -425,19 +456,6 @@ class BacktestEngine:
                 trades=[], equity_curve=eq, daily_pnl=dp,
                 metrics=metrics, config_summary=self._config_summary(config),
             )
-
-        # ── Load L2 data if any L2 filters are active ──
-        l2_snapshots: list[tuple[int, L2Snapshot]] = []  # (timestamp_ns, snapshot)
-        has_l2_filters = any([
-            config.depth_monitor, config.weighted_mid_monitor,
-            config.mid_momentum_monitor, config.iceberg_detector,
-            config.absorption_detector, config.hidden_liquidity_detector,
-        ])
-        if has_l2_filters:
-            l2_df = config.prebuilt_l2 if config.prebuilt_l2 is not None else self._load_l2(config)
-            if l2_df is not None and not l2_df.is_empty():
-                l2_snapshots = self._build_l2_index(l2_df)
-        l2_idx = 0  # pointer into l2_snapshots for time-aligned iteration
 
         # ── Vectorized preprocessing (replaces per-row Python work) ──
         # Convert naive-UTC timestamps to US/Eastern and compute epoch ns
@@ -470,15 +488,28 @@ class BacktestEngine:
             pl.col("_et_ts").dt.time().alias("_bar_time"),
         )
 
+        # Auto-compute multi-timeframe stage bundles if filter rules specify bar freqs
+        if (
+            config.filter_engine is not None
+            and config.filter_engine.bar_freqs
+            and config.filter_stage_bundles is None
+        ):
+            config.filter_stage_bundles = self._precompute_stage_bundles(
+                config, bars_df
+            )
+
         oms = SimulatedOMS(
             commission_model=config.commission_model,
             slippage_model=config.slippage_model,
             max_position=config.max_position,
         )
 
+        # Bar window for signal computation
+        signal_bar_window: list[BarEvent] = []
+
         all_trades: list[Trade] = []
         prev_date: date | None = None
-        signal_counts = {s.config.strategy_id: 0 for s in config.strategies}
+        signal_counts = {_get_strategy_id(s): 0 for s in config.strategies}
         session_close_time = _sub_time(config.session_end, seconds=1)
 
         n_bars = len(bars_df)
@@ -507,7 +538,7 @@ class BacktestEngine:
 
                 for strat in config.strategies:
                     strat.reset()
-                signal_counts = {s.config.strategy_id: 0 for s in config.strategies}
+                signal_counts = {_get_strategy_id(s): 0 for s in config.strategies}
 
             prev_date = bar_date
             last_bar_time = bar_time
@@ -532,124 +563,55 @@ class BacktestEngine:
                 aggressive_sell_vol=float(row.get("aggressive_sell_vol", 0.0) or 0.0),
             )
 
-            # Feed filters with bar data
-            # Use avg_bid/ask_price (from enriched bars) for spread monitor
-            if config.spread_monitor and bar_event.avg_bid_price > 0 and bar_event.avg_ask_price > 0:
-                snap = SpreadSnapshot(
-                    timestamp=bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time,
-                    bid=bar_event.avg_bid_price,
-                    ask=bar_event.avg_ask_price,
-                )
-                config.spread_monitor.push_sync(snap)
+            # Compute signals and evaluate filters
+            bundle = EMPTY_BUNDLE
+            if config.prebuilt_bundles is not None:
+                bundle = config.prebuilt_bundles[bar_index]
 
-            if config.vpin_monitor and bar_event.volume > 0:
-                naive_ts = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
-                # Use actual L1 trade classification when available, fall back to BVC
-                if bar_event.aggressive_buy_vol > 0 or bar_event.aggressive_sell_vol > 0:
-                    config.vpin_monitor.on_bar_l1(
-                        buy_vol=bar_event.aggressive_buy_vol,
-                        sell_vol=bar_event.aggressive_sell_vol,
-                        timestamp=naive_ts,
-                    )
-                else:
-                    config.vpin_monitor.on_bar_approx(
-                        open_=bar_event.open,
-                        close=bar_event.close,
-                        volume=bar_event.volume,
-                        timestamp=naive_ts,
-                        high=bar_event.high,
-                        low=bar_event.low,
-                    )
+                # Evaluate filters — if they fail, skip strategy dispatch
+                if config.filter_engine is not None:
+                    if not self._evaluate_filters(config, bundle, bar_index):
+                        bundle = EMPTY_BUNDLE
+            elif config.enriched_signal_names is not None:
+                # Build bundle inline from pre-computed sig_* columns in the row
+                from src.signals.bundle_from_columns import bundle_from_row
+                bundle = bundle_from_row(row, config.enriched_signal_names)
 
-            # Feed L2 filters with time-aligned snapshots
-            if has_l2_filters and l2_snapshots:
-                bar_ns = row["_timestamp_ns"]
-                naive_ts = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
-                # Advance L2 pointer to latest snapshot at or before this bar
-                while l2_idx < len(l2_snapshots) - 1 and l2_snapshots[l2_idx + 1][0] <= bar_ns:
-                    l2_idx += 1
-                if l2_idx < len(l2_snapshots) and l2_snapshots[l2_idx][0] <= bar_ns:
-                    l2_snap = l2_snapshots[l2_idx][1]
-                    if config.depth_monitor:
-                        config.depth_monitor.push_sync(l2_snap)
-                    if config.weighted_mid_monitor and l2_snap.bids and l2_snap.asks:
-                        wm_snap = WeightedMidSnapshot(
-                            timestamp=naive_ts,
-                            bid=l2_snap.bids[0][0], ask=l2_snap.asks[0][0],
-                            bid_size_top=l2_snap.bids[0][1], ask_size_top=l2_snap.asks[0][1],
-                        )
-                        config.weighted_mid_monitor.push_sync(wm_snap)
-                    if config.mid_momentum_monitor and l2_snap.bids and l2_snap.asks:
-                        mid_snap = MidSnapshot(
-                            timestamp=naive_ts,
-                            bid=l2_snap.bids[0][0], ask=l2_snap.asks[0][0],
-                        )
-                        config.mid_momentum_monitor.push_sync(mid_snap)
-                    if config.iceberg_detector:
-                        config.iceberg_detector.push_l2(l2_snap)
-                    if config.absorption_detector:
-                        config.absorption_detector.push_l2(l2_snap)
-                    if config.hidden_liquidity_detector:
-                        config.hidden_liquidity_detector.update_book(l2_snap)
-                        # Check trades at bar close for hidden liquidity
-                        if config.hidden_liquidity_map and bar_event.volume > 0:
-                            evt = config.hidden_liquidity_detector.check_trade(
-                                bar_event.close, int(bar_event.volume), naive_ts)
-                            if evt:
-                                config.hidden_liquidity_map.record_hidden_event(
-                                    evt.price, evt.size, evt.timestamp)
+                if config.filter_engine is not None:
+                    if not self._evaluate_filters(config, bundle, bar_index):
+                        bundle = EMPTY_BUNDLE
+            elif config.signal_engine is not None:
+                signal_bar_window.append(bar_event)
+                if len(signal_bar_window) > 500:
+                    signal_bar_window = signal_bar_window[-500:]
+                bundle = config.signal_engine.compute(signal_bar_window)
 
-            # Feed bar to each strategy and detect new signals
+                # Evaluate filters — if they fail, skip strategy dispatch
+                if config.filter_engine is not None:
+                    if not self._evaluate_filters(config, bundle, bar_index):
+                        bundle = EMPTY_BUNDLE
+
+            # Feed bar to each strategy
             for strat in config.strategies:
-                prev_count = len(strat._signals_generated)
-
-                strat.on_bar(bar_event)
-
-                new_count = len(strat._signals_generated)
-                if new_count > prev_count:
-                    for sig in strat._signals_generated[prev_count:]:
-                        if oms.open_position_count < config.max_position:
-                            # Spread filter gate
-                            if config.spread_monitor:
-                                spread_ok, _ = config.spread_monitor.is_spread_normal()
-                                if not spread_ok:
-                                    continue
-                            # VPIN regime gate
-                            if config.vpin_monitor:
-                                vpin_blocked, _ = config.vpin_monitor.should_block(sig.strategy_id)
-                                if vpin_blocked:
-                                    continue
-                            # L2 filter gates
-                            if config.depth_monitor:
-                                trade_side = "ask" if sig.direction == Direction.LONG else "bid"
-                                if config.depth_monitor.is_thinning(trade_side):
-                                    continue
-                            if config.weighted_mid_monitor:
-                                wm_sig = config.weighted_mid_monitor.latest_signal
-                                if wm_sig:
-                                    if sig.direction == Direction.LONG and wm_sig.lean == "down":
-                                        continue
-                                    if sig.direction == Direction.SHORT and wm_sig.lean == "up":
-                                        continue
-                            if config.mid_momentum_monitor:
-                                mom_sig = config.mid_momentum_monitor.latest_signal
-                                if mom_sig:
-                                    if sig.direction == Direction.LONG and mom_sig.direction == "down":
-                                        continue
-                                    if sig.direction == Direction.SHORT and mom_sig.direction == "up":
-                                        continue
-                            if config.absorption_detector:
-                                abs_sigs = config.absorption_detector.push_l2(l2_snapshots[l2_idx][1]) if l2_snapshots and l2_idx < len(l2_snapshots) else []
-                                if any(s.status == "absorbing" for s in abs_sigs):
-                                    continue
-                            oms.on_signal(sig, bar_index)
+                try:
+                    signal = strat.on_bar(bar_event, bundle)
+                except TypeError:
+                    signal = strat.on_bar(bar_event)
+                if signal is not None and oms.open_position_count < config.max_position:
+                    oms.on_signal(signal, bar_index)
 
             # Get current ATR for slippage model
             current_atr = self._get_atr(config.strategies)
 
+            # Build early exit callback from strategies that support it
+            early_exit_fn = self._build_early_exit_fn(
+                config.strategies, bar_event, bundle
+            )
+
             # Process fills
             trades = oms.on_bar(
-                bar_event, bar_index, bar_time, bar_date, current_atr
+                bar_event, bar_index, bar_time, bar_date, current_atr,
+                early_exit_fn=early_exit_fn,
             )
             all_trades.extend(trades)
 
@@ -697,13 +659,92 @@ class BacktestEngine:
             config_summary=self._config_summary(config),
         )
 
+    def precompute_bundles(
+        self, config: BacktestConfig
+    ) -> list[SignalBundle]:
+        """Pre-compute SignalBundles for all bars in the dataset.
+
+        Runs the signal engine once over the full bar series so that
+        parameter sweeps can reuse bundles without recomputation.
+        """
+        bars_df = config.prebuilt_bars if config.prebuilt_bars is not None else self._load_bars(config)
+        if bars_df.is_empty():
+            return []
+
+        # Same preprocessing as run()
+        bars_df = bars_df.with_columns(
+            pl.col("timestamp")
+                .dt.replace_time_zone("UTC")
+                .dt.convert_time_zone("US/Eastern")
+                .alias("_et_ts"),
+            (pl.col("timestamp").cast(pl.Int64) * (1 if bars_df["timestamp"].dtype == pl.Datetime("ns") else 1000)).alias("_timestamp_ns"),
+        )
+
+        if not config.use_rth_bars:
+            bars_df = bars_df.filter(
+                (pl.col("_et_ts").dt.time() >= config.session_start)
+                & (pl.col("_et_ts").dt.time() < config.session_end)
+            )
+
+        if bars_df.is_empty() or config.signal_engine is None:
+            return [EMPTY_BUNDLE] * len(bars_df)
+
+        bar_type = "5s" if config.use_rth_bars else (config.resample_freq or config.bar_type)
+        signal_bar_window: list[BarEvent] = []
+        bundles: list[SignalBundle] = []
+
+        for row in bars_df.iter_rows(named=True):
+            bar_event = BarEvent(
+                symbol=config.symbol,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=int(row["volume"]),
+                bar_type=bar_type,
+                timestamp_ns=row["_timestamp_ns"],
+                avg_bid_size=float(row.get("avg_bid_size", 0.0) or 0.0),
+                avg_ask_size=float(row.get("avg_ask_size", 0.0) or 0.0),
+                avg_bid_price=float(row.get("avg_bid_price", 0.0) or 0.0),
+                avg_ask_price=float(row.get("avg_ask_price", 0.0) or 0.0),
+                aggressive_buy_vol=float(row.get("aggressive_buy_vol", 0.0) or 0.0),
+                aggressive_sell_vol=float(row.get("aggressive_sell_vol", 0.0) or 0.0),
+            )
+            signal_bar_window.append(bar_event)
+            if len(signal_bar_window) > 500:
+                signal_bar_window = signal_bar_window[-500:]
+            bundles.append(config.signal_engine.compute(signal_bar_window))
+
+        return bundles
+
     def _load_bars(self, config: BacktestConfig) -> pl.DataFrame:
-        """Load bars from Parquet files for the date range."""
+        """Load bars from Parquet files for the date range.
+
+        Checks the persistent bar cache first. If a cached file exists for
+        the bar configuration, loads from there instead of rebuilding.
+        """
         import os
+        from src.data.bar_cache import BarCache
 
         # If L1 data is configured, aggregate ticks into enriched bars
         if config.l1_parquet_dir:
             return self._load_l1_bars(config)
+
+        # Determine cache name based on bar type
+        if config.dollar_threshold is not None:
+            cache_name = BarCache.bar_name(dollar_threshold=config.dollar_threshold)
+        else:
+            cache_name = BarCache.bar_name(freq=config.resample_freq or config.bar_type)
+        cached = BarCache.load(cache_name)
+        if cached is not None:
+            logger.info("bar_cache_hit", name=cache_name, rows=len(cached))
+            # Filter to date range
+            start_dt = datetime.combine(config.start_date, time(0, 0))
+            end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
+            cached = cached.filter(
+                (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
+            )
+            return cached.sort("timestamp")
 
         parquet_dir = config.rth_parquet_dir if config.use_rth_bars else config.parquet_dir
 
@@ -722,6 +763,18 @@ class BacktestEngine:
 
         df = pl.concat(frames)
 
+        # Build dollar bars or resample to coarser time bars
+        if config.dollar_threshold is not None:
+            from src.data.bars import build_dollar_bars
+            df = build_dollar_bars(df, config.dollar_threshold)
+        elif config.resample_freq and not config.use_rth_bars:
+            from src.data.bars import resample_bars
+            df = resample_bars(df, config.resample_freq)
+
+        # Save full dataset to cache (before date filtering)
+        if len(df) > 0:
+            BarCache.save(cache_name, df)
+
         # Filter by date range using naive datetime (matches Parquet Datetime(us) schema)
         start_dt = datetime.combine(config.start_date, time(0, 0))
         end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
@@ -729,11 +782,6 @@ class BacktestEngine:
             (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
         )
         df = df.sort("timestamp")
-
-        # Resample to coarser bars if requested and not using pre-built RTH bars
-        if config.resample_freq and not config.use_rth_bars:
-            from src.data.bars import resample_bars
-            df = resample_bars(df, config.resample_freq)
 
         return df
 
@@ -743,8 +791,23 @@ class BacktestEngine:
         L1 data has: timestamp, price, size, side, bid_price, ask_price, bid_size, ask_size.
         Aggregates into bars with: open, high, low, close, volume, avg_bid_size, avg_ask_size,
         aggressive_buy_vol, aggressive_sell_vol.
+
+        Checks the persistent bar cache first.
         """
         import os
+        from src.data.bar_cache import BarCache
+
+        # Check bar cache
+        cache_name = BarCache.bar_name(source="l1", l1_seconds=config.l1_bar_seconds)
+        cached = BarCache.load(cache_name)
+        if cached is not None:
+            logger.info("bar_cache_hit", name=cache_name, rows=len(cached))
+            start_dt = datetime.combine(config.start_date, time(0, 0))
+            end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
+            cached = cached.filter(
+                (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
+            )
+            return cached.sort("timestamp")
 
         frames = []
         for year in range(config.start_date.year, config.end_date.year + 1):
@@ -761,15 +824,6 @@ class BacktestEngine:
         # Strip timezone if present (L1 uses ns precision)
         if df["timestamp"].dtype == pl.Datetime("ns", "UTC") or df["timestamp"].dtype == pl.Datetime("us", "UTC"):
             df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
-
-        start_dt = datetime.combine(config.start_date, time(0, 0))
-        end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
-        df = df.filter(
-            (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
-        )
-
-        if df.is_empty():
-            return pl.DataFrame()
 
         # Classify aggressive trades via Lee-Ready: compare trade price to mid
         df = df.with_columns(
@@ -796,6 +850,8 @@ class BacktestEngine:
             pl.col("size").sum().alias("volume"),
             pl.col("bid_size").mean().alias("avg_bid_size"),
             pl.col("ask_size").mean().alias("avg_ask_size"),
+            pl.col("bid_price").mean().alias("avg_bid_price"),
+            pl.col("ask_price").mean().alias("avg_ask_price"),
             pl.col("_agg_buy").sum().alias("aggressive_buy_vol"),
             pl.col("_agg_sell").sum().alias("aggressive_sell_vol"),
         )
@@ -804,87 +860,19 @@ class BacktestEngine:
         bars = bars.filter(pl.col("volume") > 0)
         bars = bars.sort("timestamp")
 
-        logger.info("l1_bars_built", ticks=len(df), bars=len(bars), interval=interval)
-        return bars
-
-    def _load_l2(self, config: BacktestConfig) -> pl.DataFrame | None:
-        """Load L2 snapshot Parquet files for the date range."""
-        import os
-
-        if not config.l2_parquet_dir:
-            return None
-
-        frames = []
-        parquet_dir = config.l2_parquet_dir
-        # Support flat directory or year-partitioned
-        if os.path.isdir(parquet_dir):
-            for f in sorted(os.listdir(parquet_dir)):
-                if f.endswith(".parquet"):
-                    frames.append(pl.read_parquet(os.path.join(parquet_dir, f)))
-
-        if not frames:
-            logger.warning("no_l2_data", dir=parquet_dir)
-            return None
-
-        df = pl.concat(frames)
+        # Save full dataset to cache (before date filtering)
+        if len(bars) > 0:
+            BarCache.save(cache_name, bars)
 
         # Filter to date range
-        if "timestamp" in df.columns:
-            if df["timestamp"].dtype == pl.Datetime("ns", "UTC") or df["timestamp"].dtype == pl.Datetime("us", "UTC"):
-                df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
-            start_dt = datetime.combine(config.start_date, time(0, 0))
-            end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
-            df = df.filter(
-                (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
-            )
+        start_dt = datetime.combine(config.start_date, time(0, 0))
+        end_dt = datetime.combine(config.end_date + timedelta(days=1), time(0, 0))
+        bars = bars.filter(
+            (pl.col("timestamp") >= start_dt) & (pl.col("timestamp") < end_dt)
+        )
 
-        return df.sort("timestamp") if not df.is_empty() else None
-
-    def _build_l2_index(self, l2_df: pl.DataFrame) -> list[tuple[int, L2Snapshot]]:
-        """Convert L2 DataFrame rows to time-indexed L2Snapshots.
-
-        Expected columns: timestamp, bid_px_1..10, bid_sz_1..10, ask_px_1..10, ask_sz_1..10.
-        Alternatively accepts ts_event (nanosecond epoch int) instead of timestamp.
-        """
-        # If ts_event column exists, use it directly (avoids naive datetime timezone issues)
-        has_ts_event = "ts_event" in l2_df.columns
-        result = []
-        for row in l2_df.iter_rows(named=True):
-            if has_ts_event:
-                ts_ns = int(row["ts_event"])
-            else:
-                ts = row["timestamp"]
-                if hasattr(ts, "timestamp"):
-                    # Treat naive datetimes as UTC to match bar timestamps
-                    import calendar
-                    ts_ns = int(calendar.timegm(ts.timetuple()) * 1_000_000_000)
-                    ts_ns += ts.microsecond * 1000
-                else:
-                    ts_ns = int(ts)
-
-            bids = []
-            asks = []
-            for i in range(1, 11):
-                bp = row.get(f"bid_px_{i}", 0.0)
-                bs = row.get(f"bid_sz_{i}", 0)
-                ap = row.get(f"ask_px_{i}", 0.0)
-                az = row.get(f"ask_sz_{i}", 0)
-                if bp and bs:
-                    bids.append((float(bp), int(bs)))
-                if ap and az:
-                    asks.append((float(ap), int(az)))
-
-            snap_ts = row.get("timestamp") if not has_ts_event else None
-            if snap_ts is None or not isinstance(snap_ts, datetime):
-                snap_ts = datetime.utcfromtimestamp(ts_ns / 1e9)
-            snap = L2Snapshot(
-                timestamp=snap_ts,
-                bids=bids,
-                asks=asks,
-            )
-            result.append((ts_ns, snap))
-
-        return result
+        logger.info("l1_bars_built", ticks=len(df), bars=len(bars), interval=interval)
+        return bars
 
     def _is_new_session(self, prev_date: date | None, current_date: date) -> bool:
         """Detect session boundary (new trading day)."""
@@ -912,10 +900,203 @@ class BacktestEngine:
         """Convert a row's timestamp (naive UTC datetime) to ET datetime."""
         return row["timestamp"].replace(tzinfo=timezone.utc).astimezone(_ET)
 
-    def _get_atr(self, strategies: list[StrategyBase]) -> float:
-        """Read ATR from the first strategy's feature hub."""
-        if strategies and strategies[0]._last_snapshot is not None:
-            return strategies[0]._last_snapshot.atr_ticks
+    def _precompute_stage_bundles(
+        self,
+        config: BacktestConfig,
+        primary_bars_df: pl.DataFrame,
+    ) -> dict[int, list[SignalBundle]]:
+        """Pre-compute SignalBundles for multi-timeframe filter sequences.
+
+        For each seq with a `bar` freq in the filter engine, resamples the
+        source bars to that freq, computes signals, and builds a time-aligned
+        bundle list indexed by primary bar position.
+
+        Returns:
+            dict mapping seq -> list of SignalBundles aligned to primary bars.
+        """
+        from src.data.bars import resample_bars
+
+        fe = config.filter_engine
+        bar_freqs = fe.bar_freqs  # {seq: "5m", seq2: "15m", ...}
+        signal_engine = config.signal_engine
+
+        if not bar_freqs or signal_engine is None:
+            return {}
+
+        # Primary bar timestamps for alignment
+        primary_timestamps = primary_bars_df["timestamp"].to_list()
+        n_primary = len(primary_timestamps)
+
+        stage_bundles: dict[int, list[SignalBundle]] = {}
+
+        # Group seqs by bar freq to avoid duplicate resampling
+        freq_to_seqs: dict[str, list[int]] = {}
+        for seq, freq in bar_freqs.items():
+            freq_to_seqs.setdefault(freq, []).append(seq)
+
+        bar_type_str = config.resample_freq or config.bar_type
+
+        for freq, seqs in freq_to_seqs.items():
+            # Skip if this freq matches the primary bar freq (already computed)
+            if freq == bar_type_str:
+                continue
+
+            # Resample source bars to this timeframe
+            resampled = resample_bars(primary_bars_df, freq)
+            if resampled.is_empty():
+                for seq in seqs:
+                    stage_bundles[seq] = [EMPTY_BUNDLE] * n_primary
+                continue
+
+            resampled_ts = resampled["timestamp"].to_list()
+
+            # Pre-add _et_ts/_timestamp_ns if not present
+            if "_timestamp_ns" not in resampled.columns:
+                resampled = resampled.with_columns(
+                    (pl.col("timestamp").cast(pl.Int64) * (
+                        1 if resampled["timestamp"].dtype == pl.Datetime("ns") else 1000
+                    )).alias("_timestamp_ns"),
+                )
+
+            # Compute signals for each resampled bar
+            signal_bar_window: list[BarEvent] = []
+            resampled_bundles: list[SignalBundle] = []
+
+            for row in resampled.iter_rows(named=True):
+                bar_event = BarEvent(
+                    symbol=config.symbol,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=int(row["volume"]),
+                    bar_type=freq,
+                    timestamp_ns=row["_timestamp_ns"],
+                    avg_bid_size=float(row.get("avg_bid_size", 0.0) or 0.0),
+                    avg_ask_size=float(row.get("avg_ask_size", 0.0) or 0.0),
+                    avg_bid_price=float(row.get("avg_bid_price", 0.0) or 0.0),
+                    avg_ask_price=float(row.get("avg_ask_price", 0.0) or 0.0),
+                    aggressive_buy_vol=float(row.get("aggressive_buy_vol", 0.0) or 0.0),
+                    aggressive_sell_vol=float(row.get("aggressive_sell_vol", 0.0) or 0.0),
+                )
+                signal_bar_window.append(bar_event)
+                if len(signal_bar_window) > 500:
+                    signal_bar_window = signal_bar_window[-500:]
+                resampled_bundles.append(signal_engine.compute(signal_bar_window))
+
+            # Time-align: for each primary bar, find the most recent resampled bar
+            # that started at or before this primary bar's timestamp.
+            aligned: list[SignalBundle] = []
+            rs_idx = 0
+            n_resampled = len(resampled_ts)
+
+            for p_ts in primary_timestamps:
+                # Advance rs_idx to the latest resampled bar <= p_ts
+                while rs_idx + 1 < n_resampled and resampled_ts[rs_idx + 1] <= p_ts:
+                    rs_idx += 1
+
+                if rs_idx < n_resampled and resampled_ts[rs_idx] <= p_ts:
+                    aligned.append(resampled_bundles[rs_idx])
+                else:
+                    aligned.append(EMPTY_BUNDLE)
+
+            for seq in seqs:
+                stage_bundles[seq] = aligned
+
+            logger.info(
+                "stage_bundles_built",
+                freq=freq,
+                seqs=seqs,
+                resampled_bars=n_resampled,
+                primary_bars=n_primary,
+            )
+
+        return stage_bundles
+
+    def _evaluate_filters(
+        self, config: BacktestConfig, bundle: SignalBundle, bar_index: int
+    ) -> bool:
+        """Evaluate filter engine, including multi-seq stages.
+
+        For single-seq filters (all seq=1), this is equivalent to
+        config.filter_engine.evaluate(bundle).
+
+        For multi-seq filters, evaluates seq=1 against the primary bundle,
+        then seq=2+ against pre-computed bundles from filter_stage_bundles.
+        Short-circuits on first failing seq.
+
+        Returns True if all sequences pass.
+        """
+        fe = config.filter_engine
+        sequences = fe.sequences
+
+        if not sequences:
+            return True
+
+        # If no multi-seq stages configured, evaluate all rules at once
+        if config.filter_stage_bundles is None:
+            return fe.evaluate(bundle).passes
+
+        # Multi-seq: evaluate each sequence in order
+        for seq in sequences:
+            if seq == 1:
+                # seq=1 uses the primary bundle (from signal_engine)
+                result = fe.evaluate_seq(bundle, seq=1)
+            else:
+                # Higher seqs use pre-computed bundles
+                stage_bundles = config.filter_stage_bundles.get(seq)
+                if stage_bundles is None or bar_index >= len(stage_bundles):
+                    continue  # No data for this seq — skip
+                result = fe.evaluate_seq(stage_bundles[bar_index], seq=seq)
+
+            if not result.passes:
+                return False
+
+        return True
+
+    def _build_early_exit_fn(
+        self,
+        strategies: list,
+        bar: BarEvent,
+        bundle: SignalBundle,
+    ):
+        """Build an early exit callback for the current bar.
+
+        Returns a callable (order, bar, bar_index) -> str | None, or None
+        if no strategy supports early exits.
+        """
+        # Find strategies with check_early_exit method
+        exit_strategies = {
+            _get_strategy_id(s): s
+            for s in strategies
+            if hasattr(s, "check_early_exit")
+        }
+        if not exit_strategies:
+            return None
+
+        def _fn(order: PendingOrder, bar: BarEvent, bar_index: int) -> str | None:
+            strat = exit_strategies.get(order.strategy_id)
+            if strat is None:
+                return None
+            bars_in_trade = bar_index - order.fill_bar_index
+            return strat.check_early_exit(
+                bar=bar,
+                bundle=bundle,
+                bars_in_trade=bars_in_trade,
+                direction=order.direction,
+                fill_price=order.fill_price,
+            )
+
+        return _fn
+
+    def _get_atr(self, strategies: list) -> float:
+        """Read ATR from the first strategy's feature hub (if available)."""
+        if strategies:
+            s = strategies[0]
+            # StrategyBase stores _last_snapshot with atr_ticks
+            snap = getattr(s, "_last_snapshot", None)
+            if snap is not None and hasattr(snap, "atr_ticks"):
+                return snap.atr_ticks
         return 1.0  # Default if no snapshot yet
 
     def _config_summary(self, config: BacktestConfig) -> dict:
@@ -928,7 +1109,7 @@ class BacktestEngine:
             "bar_type": config.bar_type,
             "max_position": config.max_position,
             "commission_per_side": config.commission_model.commission_per_side,
-            "strategies": [s.config.strategy_id for s in config.strategies],
+            "strategies": [_get_strategy_id(s) for s in config.strategies],
         }
 
 

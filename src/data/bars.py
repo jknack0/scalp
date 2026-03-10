@@ -8,30 +8,67 @@ def resample_bars(df: pl.DataFrame, freq: str) -> pl.DataFrame:
 
     Args:
         df: DataFrame with columns: timestamp, open, high, low, close, volume, vwap
+            Optionally includes L1 enrichment columns (avg_bid_price, avg_ask_price, etc.)
         freq: Polars duration string, e.g. "1m", "5m", "15m", "1h"
 
     Returns:
-        Resampled DataFrame with same columns.
+        Resampled DataFrame with same columns. L1 fields are volume-weighted averages.
     """
-    return (
+    has_vwap = "vwap" in df.columns
+
+    agg_exprs = [
+        pl.col("open").first(),
+        pl.col("high").max(),
+        pl.col("low").min(),
+        pl.col("close").last(),
+        pl.col("volume").sum(),
+        pl.col("volume").sum().alias("_vol_sum"),
+    ]
+    if has_vwap:
+        agg_exprs.append(
+            (pl.col("vwap") * pl.col("volume")).sum().alias("_vwap_vol")
+        )
+
+    # Aggregate L1 enrichment columns if present (volume-weighted average for prices)
+    l1_price_cols = ["avg_bid_price", "avg_ask_price", "avg_bid_size", "avg_ask_size"]
+    l1_vol_cols = ["aggressive_buy_vol", "aggressive_sell_vol"]
+
+    has_l1 = any(c in df.columns for c in l1_price_cols)
+    if has_l1:
+        for col in l1_price_cols:
+            if col in df.columns:
+                agg_exprs.append(
+                    (pl.col(col) * pl.col("volume")).sum().alias(f"_{col}_vol")
+                )
+        for col in l1_vol_cols:
+            if col in df.columns:
+                agg_exprs.append(pl.col(col).sum())
+
+    result = (
         df.sort("timestamp")
         .group_by_dynamic("timestamp", every=freq)
-        .agg([
-            pl.col("open").first(),
-            pl.col("high").max(),
-            pl.col("low").min(),
-            pl.col("close").last(),
-            pl.col("volume").sum(),
-            # Volume-weighted VWAP
-            (pl.col("vwap") * pl.col("volume")).sum().alias("_vwap_vol"),
-            pl.col("volume").sum().alias("_vol_sum"),
-        ])
-        .with_columns(
-            (pl.col("_vwap_vol") / pl.col("_vol_sum")).alias("vwap")
-        )
-        .drop(["_vwap_vol", "_vol_sum"])
+        .agg(agg_exprs)
         .sort("timestamp")
     )
+
+    drop_cols = ["_vol_sum"]
+    if has_vwap:
+        result = result.with_columns(
+            (pl.col("_vwap_vol") / pl.col("_vol_sum")).alias("vwap")
+        )
+        drop_cols.append("_vwap_vol")
+
+    # Compute volume-weighted L1 prices
+    if has_l1:
+        for col in l1_price_cols:
+            if f"_{col}_vol" in result.columns:
+                result = result.with_columns(
+                    (pl.col(f"_{col}_vol") / pl.col("_vol_sum")).alias(col)
+                )
+                drop_cols.append(f"_{col}_vol")
+
+    result = result.drop(drop_cols)
+    return result
 
 
 def build_dollar_bars(df: pl.DataFrame, dollar_threshold: float) -> pl.DataFrame:
