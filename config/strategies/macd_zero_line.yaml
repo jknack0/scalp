@@ -1,0 +1,66 @@
+# Strategy 5: MACD Zero-Line Rejection
+# Trades histogram zero-line rejections with triple directional alignment
+# (MACD + SMA trend + VWAP bias). Trend continuation strategy.
+#
+# Geometry proof (ATR=3.0, entry=5600):
+#   LONG:  target=5607.50, stop=5595.50.  5595.50 < 5600 < 5607.50 OK
+#   SHORT: target=5592.50, stop=5604.50.  5604.50 > 5600 > 5592.50 OK
+
+strategy:
+  strategy_id: macd_zero_line
+  max_signals_per_day: 3
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [macd, sma_trend, vwap_bias, adx, relative_volume, atr, session_time]
+signal_configs:
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+    zero_approach_threshold: 0.5
+    zero_approach_lookback: 3
+  adx:
+    period: 14
+    threshold: 20.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 10:00 AM - 3:30 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 600"
+  - signal: session_time
+    expr: "<= 930"
+  # ADX must be above 20 (trending)
+  - signal: adx
+    expr: "> 20.0"
+  # Volume must be >= 0.8x average
+  - signal: relative_volume
+    expr: ">= 0.8"
+  # MACD must have zero-line rejection
+  - signal: macd
+    expr: passes
+
+exit:
+  target:
+    type: atr_multiple
+    multiplier: 2.5
+  stop:
+    type: atr_multiple
+    multiplier: 1.5
+  time_stop_minutes: 45
+
+  # Early exit conditions -- any one triggers market exit (OR logic)
+  early_exit:
+    # MACD histogram crosses zero against position
+    - type: histogram_zero_cross
+    # Adverse momentum -- 3 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 3
+      atr_multiple: 1.0

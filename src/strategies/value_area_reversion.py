@@ -72,7 +72,7 @@ class ValueAreaReversionStrategy:
         self._state = VAState.WAITING
         self._signals_today = 0
         self._current_date = None
-        self._current_regime = RegimeState.LOW_VOL_RANGE
+        self._current_regime = RegimeState.RANGE_BOUND
 
         # Prior session profile
         self._prior_vah: float = 0.0

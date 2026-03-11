@@ -1,0 +1,63 @@
+# Strategy 3: CVD Divergence Fade
+# Fades moves that lack conviction — price makes new high/low but CVD diverges.
+# Combined with volume exhaustion and VWAP bias confirmation.
+#
+# Geometry proof:
+#   SHORT: VWAP=5600, SD=4, entry=5612 (price up, CVD down)
+#     target = 5600 + 4 = 5604 (VWAP + 1SD). stop = 5612 + 1.5*3.0 = 5616.50
+#     5616.50 > 5612 > 5604  ✓
+#   LONG: VWAP=5600, SD=4, entry=5588 (price down, CVD up)
+#     target = 5600 - 4 = 5596 (VWAP - 1SD). stop = 5588 - 4.50 = 5583.50
+#     5583.50 < 5588 < 5596  ✓
+
+strategy:
+  strategy_id: cvd_divergence
+  max_signals_per_day: 6
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 1m
+  enrich: true
+
+# Signal pipeline: pre-computed per bar window
+signals: [cvd_divergence, volume_exhaustion, adx, vwap_bias, spread, atr, session_time, vwap_session]
+
+# Declarative entry gates — all must pass before strategy runs
+filters:
+  # Time-of-day: 10:00 AM - 3:30 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 600"
+  - signal: session_time
+    expr: "<= 930"
+  # CVD divergence must be present
+  - signal: cvd_divergence
+    expr: passes
+  # Volume exhaustion must be present
+  - signal: volume_exhaustion
+    expr: passes
+  # ADX: trending enough to have a move to fade, but not too strong
+  - signal: adx
+    expr: ">= 15.0"
+  - signal: adx
+    expr: "<= 35.0"
+  # Spread must be tight
+  - signal: spread
+    expr: "<= 0.50"
+
+exit:
+  target:
+    type: sd_band           # target = VWAP ± 1 SD toward VWAP
+    multiplier: 1.0
+  stop:
+    type: atr_multiple       # stop = entry ± 1.5 ATR
+    multiplier: 1.5
+  time_stop_minutes: 10
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Adverse momentum — 2 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 2
+      atr_multiple: 1.0

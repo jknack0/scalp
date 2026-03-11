@@ -81,7 +81,7 @@ class TestSignalProperties:
             signal_time=datetime(2025, 6, 2, 10, 0, tzinfo=_ET),
             expiry_time=datetime(2025, 6, 2, 10, 1, tzinfo=_ET),
             confidence=0.8,
-            regime_state=RegimeState.LOW_VOL_RANGE,
+            regime_state=RegimeState.RANGE_BOUND,
         )
         assert signal.risk_reward_ratio == pytest.approx(2.0)
         assert signal.ticks_to_target == pytest.approx(8.0)
@@ -103,7 +103,7 @@ class TestSignalIds:
             signal_time=datetime.now(_ET),
             expiry_time=datetime.now(_ET),
             confidence=0.7,
-            regime_state=RegimeState.BREAKOUT,
+            regime_state=RegimeState.VOLATILE,
         )
         s2 = Signal(
             strategy_id="test",
@@ -114,7 +114,7 @@ class TestSignalIds:
             signal_time=datetime.now(_ET),
             expiry_time=datetime.now(_ET),
             confidence=0.7,
-            regime_state=RegimeState.BREAKOUT,
+            regime_state=RegimeState.VOLATILE,
         )
         assert s1.id != s2.id
 
@@ -192,18 +192,18 @@ class TestHMMStateGating:
     def test_hmm_state_gating(self):
         """require_hmm_states filters wrong states."""
         config = _make_config(
-            require_hmm_states=[RegimeState.BREAKOUT, RegimeState.HIGH_VOL_UP]
+            require_hmm_states=[RegimeState.VOLATILE, RegimeState.VOLATILE]
         )
         strat = MockStrategy(config)
 
         in_session = datetime(2025, 6, 2, 10, 30, tzinfo=_ET)
 
-        # Default regime is LOW_VOL_RANGE — not in allowed list
-        assert strat._current_regime == RegimeState.LOW_VOL_RANGE
+        # Default regime is RANGE_BOUND — not in allowed list
+        assert strat._current_regime == RegimeState.RANGE_BOUND
         assert strat.is_valid_hmm_state() is False
         assert strat.can_generate_signal(in_session) is False
 
         # Manually set to allowed state
-        strat._current_regime = RegimeState.BREAKOUT
+        strat._current_regime = RegimeState.VOLATILE
         assert strat.is_valid_hmm_state() is True
         assert strat.can_generate_signal(in_session) is True

@@ -69,7 +69,7 @@ signal_engine = SignalEngine(fast_signal_names, signal_configs)
 
 config = BacktestConfig(
     strategies=[strategy],
-    start_date=date(2011, 3, 1),
+    start_date=date(2024, 3, 1),
     end_date=date(2025, 2, 28),
     parquet_dir="data/parquet_5m",
     resample_freq=cfg["bar"]["freq"],  # "5m"
@@ -122,7 +122,7 @@ if "hmm_regime" in signal_names and hmm_cfg.get("model_path"):
 
     # Predict all states at once (Viterbi — fast)
     t2 = _time.time()
-    states = clf.predict(features)
+    states = clf.predict_sequence(features)
     print(f"  Predicted {len(states)} states in {_time.time() - t2:.1f}s")
 
     # Align states to bars: features are offset by warm-up rows
@@ -146,9 +146,7 @@ if "hmm_regime" in signal_names and hmm_cfg.get("model_path"):
             hmm_result = SignalResult(
                 value=float(state.value),
                 passes=passes,
-                direction="long" if state == RegimeState.HIGH_VOL_UP else (
-                    "short" if state == RegimeState.HIGH_VOL_DOWN else "none"
-                ),
+                direction="none",  # HMM is a gate, not directional
                 metadata={
                     "regime": state.name,
                     "regime_value": state.value,

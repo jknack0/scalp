@@ -1,0 +1,76 @@
+# Strategy: ORB Breakout
+# First 15 min of RTH (9:30-9:45 ET) establish opening range.
+# Breakout with above-average volume extends because institutional
+# order flow creates directional momentum.
+#
+# Bar: 1m time bars
+# Entry: bar.close on breakout beyond OR boundary
+# Target: entry +/- OR range width (1.0x)
+# Stop: opposite OR boundary + 2 tick buffer (0.50 points)
+# Time stop: 60 minutes
+
+strategy:
+  strategy_id: orb_breakout
+  max_signals_per_day: 2
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 1m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [orb_breakout, orb_range_size, adx, relative_volume, vpin, session_time, atr]
+signal_configs:
+  orb_breakout:
+    orb_minutes: 15
+    require_close_beyond: true
+    min_bars_in_range: 3
+  orb_range_size:
+    orb_minutes: 15
+    atr_lookback: 14
+    min_range_atr_ratio: 0.3
+    max_range_atr_ratio: 1.5
+  adx:
+    period: 14
+    threshold: 20.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 9:45 AM - 11:30 AM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 585"
+  - signal: session_time
+    expr: "<= 690"
+  # ORB breakout must have fired
+  - signal: orb_breakout
+    expr: passes
+  # ADX > 20 (trending market)
+  - signal: adx
+    expr: "> 20.0"
+  # Relative volume >= 1.5x average
+  - signal: relative_volume
+    expr: ">= 1.5"
+  # VPIN below toxicity threshold
+  - signal: vpin
+    expr: "< 0.7"
+
+exit:
+  target:
+    type: or_width
+    multiplier: 1.0
+  stop:
+    type: first_break
+    buffer_ticks: 2
+  time_stop_minutes: 60
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Adverse momentum — 3 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 3
+      atr_multiple: 1.0
+    # VWAP slope accelerating against position
+    - type: vwap_slope
+      threshold: 0.5

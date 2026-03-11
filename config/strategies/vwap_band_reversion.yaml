@@ -1,9 +1,10 @@
 # Strategy 1: VWAP Band Reversion with regime gating
-# Mean reversion to VWAP when price deviates >=2.5 SD during range-bound sessions.
+# Mean reversion to VWAP when price deviates >=3.0 SD during range-bound sessions.
 # All entry gates are declarative filters evaluated by FilterEngine.
 #
-# Tuned 2026-03-10 sweep (Dec 2024 - Feb 2025):
-#   13 trades, 62% WR, Sharpe 8.90, PF 3.90, $154 net
+# Tuned 2026-03-11 exit sweep (Mar 2020 - Feb 2025, 5yr, ExitEngine + trailing stop):
+#   67 trades, 60% WR, Sharpe 1.24, PF 1.22, $360 net, DD 4.69%
+#   Exit mix: 42% TP, 27% hard stop, 10% trailing, 6% time, 10% early, 5% session
 
 strategy:
   strategy_id: vwap_band_reversion
@@ -17,18 +18,14 @@ bar:
   enrich: false
 
 # Signal pipeline: pre-computed per bar window
-signals: [vwap_session, rsi_momentum, adx, atr, relative_volume, session_time, hmm_regime]
+signals: [vwap_session, adx, atr, relative_volume, session_time, hmm_regime]
 signal_configs:
-  rsi_momentum:
-    period: 2
-    long_threshold: 30.0
-    short_threshold: 70.0
   adx:
     period: 14
     threshold: 25.0
   hmm_regime:
-    model_path: models/hmm/v2_5m
-    pass_states: [LOW_VOL_RANGE, MEAN_REVERSION]
+    model_path: models/hmm/v4_2state
+    pass_states: [RANGE_BOUND]
 
 # All entry gates are declarative filters
 filters:
@@ -44,31 +41,63 @@ filters:
   # VWAP slope must be flat (non-trending intraday)
   - signal: vwap_session
     field: slope
-    expr: "abs <= 0.5"
-  # Price must be >= 2.5 SD from VWAP
+    expr: "abs <= 0.3"
+  # Price must be >= 3.0 SD from VWAP
   - signal: vwap_session
     field: deviation_sd
-    expr: "abs >= 2.5"
+    expr: "abs >= 3.0"
   # ADX must be below 25 (non-strongly-trending)
   - signal: adx
     expr: "< 25.0"
   # Volume must be >= 0.5x average
   - signal: relative_volume
     expr: ">= 0.5"
-  # HMM regime: disabled for baseline test
-  # - signal: hmm_regime
-  #   expr: passes
+  # HMM regime: only trade in range-bound
+  - signal: hmm_regime
+    expr: passes
 
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+# Priority order: stops first, then targets, then trailing, then early exits
+exits:
+  # Hard stop: 3.0 x ATR from fill price
+  - type: static_stop
+    enabled: true
+    atr_multiple: 3.0
+  # Take profit: price reverts to within 0.5 SD of VWAP
+  - type: vwap_reversion_target
+    enabled: true
+    target_sd_band: 0.5
+    vwap_signal: vwap_session
+    deviation_field: deviation_sd
+  # Trailing stop: locks in profit on overachievers (1.5x ATR trail, activates at 4 ticks)
+  - type: trailing_stop
+    enabled: true
+    atr_multiple: 1.5
+    activate_after_ticks: 4
+  # Time stop: exit after 30 bars (= 150 min on 5m bars)
+  - type: time_stop
+    enabled: true
+    max_bars: 30
+  # VWAP slope going adverse = trend developing against us
+  - type: adverse_signal_exit
+    enabled: true
+    signal: vwap_session
+    field: slope
+    long_threshold: -0.5
+    short_threshold: 0.5
+  # Regime flips to volatile while in a mean-reversion trade
+  - type: regime_exit
+    enabled: true
+    hmm_signal: hmm_regime
+    hostile_regimes_long: [1]
+    hostile_regimes_short: [1]
+    min_bars_before_active: 2
+
+# Legacy exit config — kept for backward compat with ExitBuilder
 exit:
   target:
-    type: vwap                # mean-revert to VWAP
+    type: vwap
   stop:
-    type: atr_multiple        # 2.0 x ATR(14)
-    multiplier: 2.0
-  time_stop_minutes: 15       # tight time stop — take the bounce, don't overstay
-
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # VWAP slope accelerating against position = trend developing
-    - type: vwap_slope
-      threshold: 0.3
+    type: atr_multiple
+    multiplier: 3.0
+  time_stop_minutes: 150

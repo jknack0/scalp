@@ -29,6 +29,14 @@ from src.backtesting.metrics import (
 from src.backtesting.slippage import SlippageResult, VolatilitySlippageModel
 from src.core.events import BarEvent
 from src.core.logging import get_logger
+from src.exits.exit_engine import (
+    ExitContext as _ExitContext,
+    ExitEngine,
+    ExitResult,
+    StaticStop,
+    StaticTarget,
+    VWAPReversionTarget as _VWAPReversionTarget,
+)
 from src.filters.filter_engine import FilterEngine
 from src.signals.signal_bundle import EMPTY_BUNDLE, SignalBundle, SignalEngine
 from src.strategies.base import Direction, Signal, StrategyBase
@@ -132,6 +140,10 @@ class PendingOrder:
     exit_reason: str = ""
     entry_slippage_ticks: float = 0.0
     exit_slippage_ticks: float = 0.0
+    # ExitEngine support: snapshot of signal state at fill time
+    entry_snapshot: dict = field(default_factory=dict)
+    # Trailing stop state: best price seen since entry
+    peak_price: float = 0.0
 
 
 class SimulatedOMS:
@@ -148,6 +160,7 @@ class SimulatedOMS:
         tick_size: float = TICK_SIZE,
         tick_value: float = TICK_VALUE,
         point_value: float = POINT_VALUE,
+        exit_engine: ExitEngine | None = None,
     ) -> None:
         self._commission_model = commission_model
         self._slippage_model = slippage_model
@@ -155,6 +168,7 @@ class SimulatedOMS:
         self._tick_size = tick_size
         self._tick_value = tick_value
         self._point_value = point_value
+        self._exit_engine = exit_engine
         self._orders: list[PendingOrder] = []
 
     def on_signal(self, signal: Signal, bar_index: int) -> str:
@@ -186,12 +200,15 @@ class SimulatedOMS:
         bar_date: date,
         current_atr_ticks: float,
         early_exit_fn=None,
+        bundle: SignalBundle | None = None,
     ) -> list[Trade]:
         """Process a bar: check for entry fills on pending, exit fills on open.
 
         Args:
             early_exit_fn: Optional callback (order, bar, bar_index) -> str | None.
                 If it returns a non-None string, that's the early exit reason.
+            bundle: Current bar's SignalBundle. Required when using ExitEngine.
+                Used to capture entry_snapshot on fill and evaluate exit conditions.
 
         Returns:
             List of completed trades (may be empty).
@@ -232,12 +249,18 @@ class SimulatedOMS:
                     order.fill_bar_index = bar_index
                     order.fill_time = bar_time
                     order.entry_slippage_ticks = 0.0
+                    # Capture entry snapshot from bundle for ExitEngine
+                    if bundle is not None and self._exit_engine is not None:
+                        order.entry_snapshot = self._capture_entry_snapshot(bundle, order)
+                        # Initialize peak price for trailing stop
+                        order.peak_price = order.fill_price
 
             # --- Open positions: check exits ---
             if order.status == "open":
                 trade = self._check_exit(
                     order, bar, bar_index, bar_time, bar_date, current_atr_ticks,
                     early_exit_fn=early_exit_fn,
+                    bundle=bundle,
                 )
                 if trade is not None:
                     completed.append(trade)
@@ -245,6 +268,35 @@ class SimulatedOMS:
         # Clean up closed orders
         self._orders = [o for o in self._orders if o.status != "closed"]
         return completed
+
+    @staticmethod
+    def _capture_entry_snapshot(bundle: SignalBundle, order: PendingOrder) -> dict:
+        """Capture signal metadata at fill time for ExitEngine conditions."""
+        snapshot: dict = {}
+        # ATR
+        atr_result = bundle.get("atr")
+        if atr_result is not None:
+            snapshot["atr"] = atr_result.metadata.get("atr_raw", atr_result.value)
+        # VWAP session
+        vwap_result = bundle.get("vwap_session")
+        if vwap_result is not None:
+            for key in ("vwap", "sd", "deviation_sd", "slope", "session_age_bars"):
+                if key in vwap_result.metadata:
+                    snapshot[key] = vwap_result.metadata[key]
+        # ADX
+        adx_result = bundle.get("adx")
+        if adx_result is not None:
+            snapshot["adx"] = adx_result.value
+        # HMM regime
+        hmm_result = bundle.get("hmm_regime")
+        if hmm_result is not None:
+            snapshot["hmm_regime"] = int(hmm_result.value)
+        # Also copy any metadata from the signal itself
+        if order.signal.metadata:
+            for key, val in order.signal.metadata.items():
+                if key not in snapshot:
+                    snapshot[key] = val
+        return snapshot
 
     def _check_exit(
         self,
@@ -255,13 +307,26 @@ class SimulatedOMS:
         bar_date: date,
         current_atr_ticks: float,
         early_exit_fn=None,
+        bundle: SignalBundle | None = None,
     ) -> Trade | None:
         """Check if an open position should be exited on this bar.
 
+        When ExitEngine is configured, it handles ALL exit logic (stops, targets,
+        early exits) — the static target/stop/expiry checks are skipped.
+
+        Without ExitEngine, falls back to legacy behavior:
         Priority: stop > target > early_exit > expiry.
         Ambiguity rule: if both stop and target are within the bar's range,
         assume stop hit first (conservative).
         """
+        # ── ExitEngine path ──
+        if self._exit_engine is not None and bundle is not None:
+            return self._check_exit_engine(
+                order, bar, bar_index, bar_time, bar_date,
+                current_atr_ticks, bundle,
+            )
+
+        # ── Legacy path (static target/stop + early_exit_fn) ──
         stop_hit = False
         target_hit = False
 
@@ -305,6 +370,101 @@ class SimulatedOMS:
             return self._fill_exit(
                 order, bar_index, bar_time, bar_date, current_atr_ticks,
                 reason="expiry", use_slippage=True, market_price=bar.close,
+            )
+
+        return None
+
+    def _check_exit_engine(
+        self,
+        order: PendingOrder,
+        bar: BarEvent,
+        bar_index: int,
+        bar_time: datetime,
+        bar_date: date,
+        current_atr_ticks: float,
+        bundle: SignalBundle,
+    ) -> Trade | None:
+        """Check exits via ExitEngine (declarative conditions)."""
+        bars_in_trade = bar_index - order.fill_bar_index
+
+        ctx = _ExitContext(
+            bar=bar,
+            bundle=bundle,
+            direction=order.direction.value,
+            fill_price=order.fill_price,
+            bars_in_trade=bars_in_trade,
+            entry_snapshot=order.entry_snapshot,
+            peak_price=order.peak_price,
+        )
+
+        result = self._exit_engine.evaluate(ctx)
+
+        # Persist trailing stop peak price back to order
+        order.peak_price = ctx.peak_price
+
+        if result.should_exit:
+            reason = result.reason or "exit_engine"
+            # Determine if this is a limit fill (target) or market fill (stop/early)
+            is_target = reason.startswith("tp:")
+            use_slippage = not is_target
+            market_price = bar.close if use_slippage else None
+
+            # For static stop/target, compute exact price levels
+            if reason == "stop:static_stop":
+                # Stop hit — fill at stop price with slippage
+                atr = order.entry_snapshot.get("atr", 0.0)
+                for cond in self._exit_engine.conditions:
+                    if isinstance(cond, StaticStop):
+                        distance = atr * cond.atr_multiple
+                        if order.direction == Direction.LONG:
+                            stop_price = order.fill_price - distance
+                        else:
+                            stop_price = order.fill_price + distance
+                        return self._fill_exit(
+                            order, bar_index, bar_time, bar_date, current_atr_ticks,
+                            reason=reason, use_slippage=True, market_price=stop_price,
+                        )
+
+            if reason == "tp:static_target":
+                # Target hit — fill at target price, no slippage
+                atr = order.entry_snapshot.get("atr", 0.0)
+                for cond in self._exit_engine.conditions:
+                    if isinstance(cond, StaticTarget):
+                        distance = atr * cond.atr_multiple
+                        if order.direction == Direction.LONG:
+                            target_price = order.fill_price + distance
+                        else:
+                            target_price = order.fill_price - distance
+                        # Override fill to use exact target price
+                        order.target_price = target_price
+                        return self._fill_exit(
+                            order, bar_index, bar_time, bar_date, current_atr_ticks,
+                            reason="target", use_slippage=False,
+                        )
+
+            if reason == "tp:reversion_target":
+                # VWAP reversion target hit — fill at VWAP price, no slippage
+                for cond in self._exit_engine.conditions:
+                    if isinstance(cond, _VWAPReversionTarget):
+                        vwap_result = bundle.get(cond.vwap_signal) if bundle else None
+                        if vwap_result is not None:
+                            vwap = vwap_result.metadata.get("vwap", 0.0)
+                            sd = vwap_result.metadata.get("sd", 0.0)
+                            # Target price = VWAP ± target_sd_band * SD
+                            if order.direction == Direction.LONG:
+                                target_price = vwap - cond.target_sd_band * sd
+                            else:
+                                target_price = vwap + cond.target_sd_band * sd
+                            order.target_price = target_price
+                            return self._fill_exit(
+                                order, bar_index, bar_time, bar_date, current_atr_ticks,
+                                reason="target", use_slippage=False,
+                            )
+
+            # All other exits: market exit at bar.close with slippage
+            return self._fill_exit(
+                order, bar_index, bar_time, bar_date, current_atr_ticks,
+                reason=reason, use_slippage=True, market_price=bar.close,
             )
 
         return None

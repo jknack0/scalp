@@ -76,17 +76,13 @@ from src.models.hmm_regime import RegimeState
 
 # HMM state presets — curated combos per strategy style
 _HMM_BREAKOUT_PRESETS = [
-    [RegimeState.HIGH_VOL_UP, RegimeState.HIGH_VOL_DOWN, RegimeState.BREAKOUT],
-    [RegimeState.BREAKOUT],
-    [RegimeState.HIGH_VOL_UP, RegimeState.HIGH_VOL_DOWN],
+    [RegimeState.VOLATILE],
 ]
 _HMM_REVERSION_PRESETS = [
-    [RegimeState.LOW_VOL_RANGE, RegimeState.MEAN_REVERSION],
-    [RegimeState.LOW_VOL_RANGE],
+    [RegimeState.RANGE_BOUND],
 ]
 _HMM_PULLBACK_PRESETS = [
-    [RegimeState.HIGH_VOL_UP, RegimeState.HIGH_VOL_DOWN],
-    [RegimeState.HIGH_VOL_UP, RegimeState.HIGH_VOL_DOWN, RegimeState.BREAKOUT],
+    [RegimeState.VOLATILE],
 ]
 
 # Grid sizes target ~50-80 combos per strategy to keep WFA runtime manageable.

@@ -1,0 +1,65 @@
+# Strategy 4: TTM Squeeze Breakout
+# Volatility compression (BB inside KC) -> breakout on release.
+# Direction confirmed by close vs Keltner bands + RSI momentum.
+
+strategy:
+  strategy_id: ttm_squeeze
+  max_signals_per_day: 3
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Squeeze detection parameters
+squeeze:
+  min_squeeze_bars: 6
+
+# Signal pipeline: pre-computed per bar window
+signals: [keltner_channel, bollinger, rsi_momentum, relative_volume, atr, session_time]
+signal_configs:
+  keltner_channel:
+    period: 20
+    atr_period: 20
+    multiplier: 1.5
+  bollinger:
+    period: 20
+    num_std: 2.0
+  rsi_momentum:
+    period: 14
+    long_min: 55.0
+    short_max: 45.0
+  atr:
+    period: 14
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 9:45 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 585"
+  - signal: session_time
+    expr: "<= 900"
+  # Volume must be >= 1.2x average
+  - signal: relative_volume
+    expr: ">= 1.2"
+
+exit:
+  target:
+    type: atr_multiple
+    multiplier: 2.0
+  stop:
+    type: atr_multiple
+    multiplier: 1.0
+  time_stop_minutes: 30
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Price re-enters Keltner Channel within 3 bars of entry
+    - type: keltner_reentry
+      bars: 3
+    # Adverse momentum — 2 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 2
+      atr_multiple: 1.0

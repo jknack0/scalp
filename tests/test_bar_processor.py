@@ -36,7 +36,7 @@ def _signal(strategy_id: str = "test") -> Signal:
         signal_time=now,
         expiry_time=now + timedelta(minutes=30),
         confidence=0.8,
-        regime_state=RegimeState.LOW_VOL_RANGE,
+        regime_state=RegimeState.RANGE_BOUND,
     )
 
 

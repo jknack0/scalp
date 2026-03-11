@@ -1,0 +1,77 @@
+# Strategy 6: POC Magnet + Value Area Bounce
+# Fades price approaching prior session VAH/VAL, targeting move back to POC.
+# Different from value_area_reversion (80% rule re-entry).
+#
+# Geometry proof:
+#   LONG: POC=5600, VAL=5590, entry=5591, ATR=3
+#     target = 5591 + (5600-5591)*0.5 = 5595.50
+#     stop = 5591 - 2.0*3 = 5585
+#     5585 < 5591 < 5595.50 ✓
+#   SHORT: POC=5600, VAH=5610, entry=5609, ATR=3
+#     target = 5609 - (5609-5600)*0.5 = 5604.50
+#     stop = 5609 + 2.0*3 = 5615
+#     5615 > 5609 > 5604.50 ✓
+
+strategy:
+  strategy_id: poc_va_bounce
+  max_signals_per_day: 4
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [value_area, poc_distance, rsi_momentum, adx, relative_volume, atr, session_time]
+signal_configs:
+  rsi_momentum:
+    period: 14
+    long_threshold: 35.0
+    short_threshold: 65.0
+  value_area:
+    price_step: 0.25
+    va_pct: 0.70
+    proximity_points: 2.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 9:45 AM - 3:30 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 585"
+  - signal: session_time
+    expr: "<= 930"
+  # Value area proximity gate
+  - signal: value_area
+    expr: passes
+  # ADX must be below 28 (non-strongly-trending)
+  - signal: adx
+    expr: "< 28.0"
+  # Volume must be >= 0.6x average
+  - signal: relative_volume
+    expr: ">= 0.6"
+
+# VA bounce-specific params
+va_bounce:
+  min_va_width: 5.0
+  max_distance_to_boundary: 1.0
+  poc_target_fraction: 0.5
+  beyond_va_exit_pts: 3.0
+
+exit:
+  # Stop via ATR multiple (target is computed dynamically in strategy)
+  stop:
+    type: atr_multiple
+    multiplier: 2.0
+  time_stop_minutes: 25
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Price closes beyond VA boundary by > 3.0 pts against position
+    - type: beyond_va
+      threshold_pts: 3.0
+    # Adverse momentum — 2 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 2
+      atr_multiple: 1.0

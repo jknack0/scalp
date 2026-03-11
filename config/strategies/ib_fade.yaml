@@ -1,0 +1,65 @@
+# Strategy 14: Initial Balance Fade
+# Fades touches of IB high/low during range-bound sessions.
+# Rejection candle + RSI confirmation at IB extremes, targeting IB mid.
+
+strategy:
+  strategy_id: ib_fade
+  max_signals_per_day: 3
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [initial_balance, adx, rsi_momentum, atr, relative_volume, session_time]
+signal_configs:
+  initial_balance:
+    ib_minutes: 60
+    proximity_points: 1.5
+    range_min: 3.0
+    range_max: 20.0
+  rsi_momentum:
+    period: 5
+    long_threshold: 35.0
+    short_threshold: 65.0
+  adx:
+    period: 14
+    threshold: 25.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 10:30 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 630"
+  - signal: session_time
+    expr: "<= 900"
+  # IB signal must pass (near IB extreme, no breakout)
+  - signal: initial_balance
+    expr: passes
+  # ADX must be below 25 (range-bound, not trending)
+  - signal: adx
+    expr: "< 25.0"
+  # Volume must be >= 0.5x average
+  - signal: relative_volume
+    expr: ">= 0.5"
+
+exit:
+  target:
+    type: ib_mid                # target IB midpoint (computed in strategy)
+  stop:
+    type: fixed_ticks           # 10 ticks (2.50 points) beyond IB extreme
+    ticks: 10
+  time_stop_minutes: 30
+  stop_ticks: 10
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # IB break: price breaks 1.0 point beyond IB range
+    - type: ib_break
+      buffer_points: 1.0
+    # ADX trending: ADX > 28 means trend developing, fade thesis fails
+    - type: adx_trending
+      threshold: 28.0

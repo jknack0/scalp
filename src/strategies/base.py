@@ -115,7 +115,7 @@ class StrategyBase(ABC):
     ) -> None:
         self.config = config
 
-        self._current_regime: RegimeState = RegimeState.LOW_VOL_RANGE
+        self._current_regime: RegimeState = RegimeState.RANGE_BOUND
         self._signals_today: int = 0
         self._signals_generated: list[Signal] = []
         self._bars_processed: int = 0

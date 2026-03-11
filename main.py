@@ -36,7 +36,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy", nargs="*", default=None,
-        help="Strategy names to run (default: all). Options: vwap_band, gap, va",
+        help="Strategy names to run (default: vwap_band, gap, va). "
+             "Options: vwap_band, gap, va, orb, cvd, ttm, macd, poc_va, "
+             "stoch_bb, ema_ribbon, micro, regime, pdh_pdl, donchian, mfi_obv, ib",
     )
     parser.add_argument(
         "--bar-interval", type=float, default=1.0,
@@ -45,27 +47,46 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+_STRATEGY_MAP: dict[str, tuple[str, str]] = {
+    # name -> (module_path, yaml_path)
+    "vwap_band": ("src.strategies.vwap_band_reversion:VWAPBandReversionStrategy", "config/strategies/vwap_band_reversion.yaml"),
+    "gap": ("src.strategies.gap_fill:GapFillStrategy", "config/strategies/gap_fill.yaml"),
+    "va": ("src.strategies.value_area_reversion:ValueAreaReversionStrategy", "config/strategies/value_area_reversion.yaml"),
+    "orb": ("src.strategies.orb_breakout:ORBBreakoutStrategy", "config/strategies/orb_breakout.yaml"),
+    "cvd": ("src.strategies.cvd_divergence:CVDDivergenceStrategy", "config/strategies/cvd_divergence.yaml"),
+    "ttm": ("src.strategies.ttm_squeeze:TTMSqueezeStrategy", "config/strategies/ttm_squeeze.yaml"),
+    "macd": ("src.strategies.macd_zero_line:MACDZeroLineStrategy", "config/strategies/macd_zero_line.yaml"),
+    "poc_va": ("src.strategies.poc_va_bounce:POCVABounceStrategy", "config/strategies/poc_va_bounce.yaml"),
+    "stoch_bb": ("src.strategies.stoch_bb_fade:StochBBFadeStrategy", "config/strategies/stoch_bb_fade.yaml"),
+    "ema_ribbon": ("src.strategies.ema_ribbon_pullback:EmaRibbonPullbackStrategy", "config/strategies/ema_ribbon_pullback.yaml"),
+    "micro": ("src.strategies.micro_pullback:MicroPullbackStrategy", "config/strategies/micro_pullback.yaml"),
+    "regime": ("src.strategies.regime_switcher:RegimeSwitcherStrategy", "config/strategies/regime_switcher.yaml"),
+    "pdh_pdl": ("src.strategies.pdh_pdl_fade:PDHPDLFadeStrategy", "config/strategies/pdh_pdl_fade.yaml"),
+    "donchian": ("src.strategies.donchian_breakout:DonchianBreakoutStrategy", "config/strategies/donchian_breakout.yaml"),
+    "mfi_obv": ("src.strategies.mfi_obv_divergence:MFIOBVDivergenceStrategy", "config/strategies/mfi_obv_divergence.yaml"),
+    "ib": ("src.strategies.ib_fade:IBFadeStrategy", "config/strategies/ib_fade.yaml"),
+}
+
+
 def _build_strategies(names: list[str] | None) -> list:
     """Instantiate requested strategies from YAML configs."""
-    from src.strategies.vwap_band_reversion import VWAPBandReversionStrategy
-    from src.strategies.gap_fill import GapFillStrategy
-    from src.strategies.value_area_reversion import ValueAreaReversionStrategy
+    import importlib
 
     if names is None:
         names = ["vwap_band", "gap", "va"]
 
+    available = ", ".join(sorted(_STRATEGY_MAP.keys()))
     strategies = []
     for name in names:
         name = name.lower()
-        if name == "vwap_band":
-            strategies.append(VWAPBandReversionStrategy.from_yaml("config/strategies/vwap_band_reversion.yaml"))
-        elif name == "gap":
-            strategies.append(GapFillStrategy.from_yaml("config/strategies/gap_fill.yaml"))
-        elif name == "va":
-            strategies.append(ValueAreaReversionStrategy.from_yaml("config/strategies/value_area_reversion.yaml"))
-        else:
-            print(f"Unknown strategy: {name}. Available: vwap_band, gap, va")
+        if name not in _STRATEGY_MAP:
+            print(f"Unknown strategy: {name}. Available: {available}")
             sys.exit(1)
+        module_class, yaml_path = _STRATEGY_MAP[name]
+        mod_path, cls_name = module_class.rsplit(":", 1)
+        mod = importlib.import_module(mod_path)
+        cls = getattr(mod, cls_name)
+        strategies.append(cls.from_yaml(yaml_path))
 
     return strategies
 
@@ -113,13 +134,10 @@ async def main() -> None:
     from config.loader import build_filter_engine, build_signal_engine, load_strategy_config
     from src.signals.signal_bundle import SignalEngine
     # Use first strategy's YAML for signal/filter config
-    strategy_yaml_map = {
-        "vwap_band": "vwap_band_reversion",
-        "gap": "gap_fill",
-        "va": "value_area_reversion",
-    }
     first_strat = (args.strategy or ["vwap_band"])[0].lower()
-    yaml_cfg = load_strategy_config(strategy_yaml_map.get(first_strat, first_strat))
+    _, yaml_path = _STRATEGY_MAP.get(first_strat, (None, None))
+    yaml_name = yaml_path.replace("config/strategies/", "").replace(".yaml", "") if yaml_path else first_strat
+    yaml_cfg = load_strategy_config(yaml_name)
     signal_engine = build_signal_engine(yaml_cfg)
     filter_engine = build_filter_engine(yaml_cfg)
 

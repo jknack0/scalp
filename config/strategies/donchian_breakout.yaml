@@ -1,0 +1,52 @@
+# Strategy 12: Donchian Channel Breakout
+# Trend-following breakout on 20-bar Donchian channel with 10-bar trailing exit channel.
+# ADX and relative volume filters gate entries to high-conviction breakouts only.
+
+strategy:
+  strategy_id: donchian_breakout
+  max_signals_per_day: 3
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [donchian_channel, adx, relative_volume, atr, session_time]
+signal_configs:
+  donchian_channel:
+    entry_period: 20
+    exit_period: 10
+  adx:
+    period: 14
+    threshold: 18.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 9:45 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 585"
+  - signal: session_time
+    expr: "<= 900"
+  # Donchian channel breakout required
+  - signal: donchian_channel
+    expr: passes
+  # ADX must show trending conditions
+  - signal: adx
+    expr: "> 18.0"
+  # Volume must be at or above average
+  - signal: relative_volume
+    expr: ">= 1.0"
+
+exit:
+  time_stop_minutes: 45
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Trailing stop via 10-bar exit channel
+    - type: donchian_trail
+    # ADX collapse — trend dying
+    - type: adx_collapse
+      threshold: 15.0

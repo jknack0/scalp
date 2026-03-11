@@ -111,15 +111,6 @@ class TestVWAPBandReversion:
         signal = strat.on_bar(bar, bundle)
         assert signal is None
 
-    def test_blocks_when_rsi_not_extreme(self):
-        """RSI not at extreme blocks signal (directional check)."""
-        strat = VWAPBandReversionStrategy(_make_config())
-        bar = _make_bar(close=5590.0)
-        bundle = _make_bundle(rsi=30.0)  # LONG needs RSI < 20
-
-        signal = strat.on_bar(bar, bundle)
-        assert signal is None
-
     def test_blocks_when_deviation_insufficient(self):
         """Price within bands blocks signal."""
         strat = VWAPBandReversionStrategy(_make_config())

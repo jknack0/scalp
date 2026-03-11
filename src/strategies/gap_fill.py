@@ -75,7 +75,7 @@ class GapFillStrategy:
         self._ib_bar_count: int = 0
         self._current_date = None
         self._session_bars: list[BarEvent] = []
-        self._current_regime = RegimeState.LOW_VOL_RANGE
+        self._current_regime = RegimeState.RANGE_BOUND
 
     @classmethod
     def from_yaml(cls, path: str) -> GapFillStrategy:

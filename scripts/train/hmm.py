@@ -70,7 +70,7 @@ def main():
         help="Output directory for trained model (default: models/hmm/v1)",
     )
     parser.add_argument(
-        "--n-states", type=int, default=5, help="Number of HMM states (default: 5)"
+        "--n-states", type=int, default=2, help="Number of HMM states (default: 2)"
     )
     parser.add_argument(
         "--bar-freq",
@@ -160,7 +160,7 @@ def main():
         print(f"    {labels[i]:<20s}{vals}")
 
     # Also check train persistence
-    train_states = clf.predict(train_features)
+    train_states = clf.predict_sequence(train_features)
     train_pers = compute_persistence_accuracy(train_states, horizon=5)
     print(f"\n  Train persistence (5-bar): {train_pers:.1%}")
 

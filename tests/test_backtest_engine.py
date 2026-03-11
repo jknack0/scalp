@@ -64,7 +64,7 @@ def _make_signal(
         signal_time=now,
         expiry_time=now + timedelta(seconds=expiry_seconds),
         confidence=0.8,
-        regime_state=RegimeState.LOW_VOL_RANGE,
+        regime_state=RegimeState.RANGE_BOUND,
     )
 
 

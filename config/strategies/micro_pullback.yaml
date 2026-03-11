@@ -1,0 +1,51 @@
+# Strategy 9: Micro-Pullback Scalp
+# On strong trend days, 1m bars show repeated micro-pullbacks to the 8 EMA.
+# Each touch with a rejection candle is a scalp entry. Hold for 4-8 ticks.
+
+strategy:
+  strategy_id: micro_pullback
+  max_signals_per_day: 10
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 1m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [ema_crossover, sma_trend, adx, atr, relative_volume, session_time]
+signal_configs:
+  adx:
+    period: 10
+  sma_trend:
+    period: 50
+
+# Declarative entry filters — all must pass before on_bar runs
+filters:
+  # Time-of-day: 9:45 AM - 3:30 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 585"
+  - signal: session_time
+    expr: "<= 930"
+  # Strong trend required
+  - signal: adx
+    expr: "> 25.0"
+  # Volume must be at least average
+  - signal: relative_volume
+    expr: ">= 1.0"
+
+exit:
+  target:
+    type: fixed_ticks
+    ticks: 8               # 2.0 points
+  stop:
+    type: fixed_ticks
+    ticks: 6               # 1.5 points
+  time_stop_minutes: 5
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Adverse momentum — 1 bar closing > 1.0 point against position
+    - type: adverse_momentum
+      threshold_points: 1.0

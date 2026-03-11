@@ -1,0 +1,62 @@
+# Strategy 13: MFI + OBV Accumulation/Distribution Divergence
+# Detects divergence between MFI (oversold/overbought) and OBV slope
+# (accumulation/distribution). Trades mean reversion when price-volume
+# indicators disagree — money flowing against price direction.
+
+strategy:
+  strategy_id: mfi_obv_divergence
+  max_signals_per_day: 5
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [mfi, obv, adx, atr, session_time, relative_volume]
+signal_configs:
+  mfi:
+    period: 14
+    oversold: 20.0
+    overbought: 80.0
+  obv:
+    lookback: 10
+  adx:
+    period: 14
+    threshold: 30.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 10:00 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 600"
+  - signal: session_time
+    expr: "<= 900"
+  # MFI must be at extreme (oversold or overbought)
+  - signal: mfi
+    expr: passes
+  # Volume must be >= 0.7x average
+  - signal: relative_volume
+    expr: ">= 0.7"
+
+exit:
+  target:
+    type: atr_multiple
+    multiplier: 1.5
+  stop:
+    type: atr_multiple
+    multiplier: 1.5
+  time_stop_minutes: 15
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # MFI reverses without price following
+    - type: mfi_reversal
+      long_exit_mfi: 40.0
+      short_exit_mfi: 60.0
+    # Adverse momentum — 2 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 2
+      atr_multiple: 1.0

@@ -141,7 +141,7 @@ class TestPaperOMS:
             signal_time=datetime.now(),
             expiry_time=datetime.now() + timedelta(minutes=60),
             confidence=0.8,
-            regime_state=RegimeState.LOW_VOL_RANGE,
+            regime_state=RegimeState.RANGE_BOUND,
         )
         order_id = await oms.submit_order(signal)
 
@@ -184,7 +184,7 @@ class TestPaperOMS:
             entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
             signal_time=datetime.now(),
             expiry_time=datetime.now() + timedelta(minutes=60),
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
+            confidence=0.8, regime_state=RegimeState.RANGE_BOUND,
         )
         await oms.submit_order(sig)
 
@@ -220,7 +220,7 @@ class TestPaperOMS:
             entry_price=5000.0, target_price=4998.0, stop_price=5002.0,
             signal_time=datetime.now(),
             expiry_time=datetime.now() + timedelta(minutes=60),
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
+            confidence=0.8, regime_state=RegimeState.RANGE_BOUND,
         )
         await oms.submit_order(sig)
 
@@ -247,7 +247,7 @@ class TestPaperOMS:
             entry_price=4990.0, target_price=4992.0, stop_price=4988.0,
             signal_time=datetime.now(),
             expiry_time=datetime.now() - timedelta(seconds=1),  # Already expired
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
+            confidence=0.8, regime_state=RegimeState.RANGE_BOUND,
         )
         oid = await oms.submit_order(sig)
 
@@ -270,7 +270,7 @@ class TestPaperOMS:
             entry_price=5000.0, target_price=5002.0, stop_price=4998.0,
             signal_time=datetime.now(),
             expiry_time=datetime.now() + timedelta(minutes=60),
-            confidence=0.8, regime_state=RegimeState.LOW_VOL_RANGE,
+            confidence=0.8, regime_state=RegimeState.RANGE_BOUND,
         )
         oid = await oms.submit_order(sig)
         order = oms.get_order(oid)

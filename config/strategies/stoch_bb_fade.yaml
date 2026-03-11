@@ -1,0 +1,74 @@
+# Strategy 7: Stochastic + Bollinger Band Fade
+# Fades extreme moves when stochastic crosses in oversold/overbought zones
+# AND price is outside Bollinger Bands, during low-ADX range-bound sessions.
+#
+# Geometry proof:
+#   SHORT: VWAP=5600, SD=4. Entry at 5610 (above upper BB).
+#     Target = VWAP + 1*SD = 5604. Stop = VWAP + 3*SD = 5612. 5612 > 5610 > 5604 OK
+#   LONG: VWAP=5600, SD=4. Entry at 5590 (below lower BB).
+#     Target = VWAP - 1*SD = 5596. Stop = VWAP - 3*SD = 5588. 5588 < 5590 < 5596 OK
+
+strategy:
+  strategy_id: stoch_bb_fade
+  max_signals_per_day: 4
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [stochastic, bollinger, adx, vwap_session, relative_volume, atr, session_time]
+signal_configs:
+  stochastic:
+    k_period: 14
+    k_smooth: 3
+    d_smooth: 3
+  bollinger:
+    period: 20
+    num_std: 2.5
+  adx:
+    period: 14
+    threshold: 25.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 10:00 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 600"
+  - signal: session_time
+    expr: "<= 900"
+  # Stochastic must have crossover in extreme zone
+  - signal: stochastic
+    expr: passes
+  # ADX must be below 25 (non-trending, range-bound)
+  - signal: adx
+    expr: "< 25.0"
+  # VWAP slope must be flat (non-trending intraday)
+  - signal: vwap_session
+    field: slope
+    expr: "abs <= 0.4"
+  # Volume must be >= 0.5x average
+  - signal: relative_volume
+    expr: ">= 0.5"
+
+exit:
+  target:
+    type: sd_band            # VWAP +/- 1 SD
+    multiplier: 1.0
+  stop:
+    type: sd_band            # VWAP +/- 3 SD (wider, on adverse side)
+    multiplier: 3.0
+  time_stop_minutes: 20
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Adverse momentum — 2 bars moving 1.0x ATR against position
+    - type: adverse_momentum
+      bars: 2
+      atr_multiple: 1.0
+    # ADX crosses above 30 — trend developing, fade thesis broken
+    - type: adx_breakout
+      threshold: 30.0

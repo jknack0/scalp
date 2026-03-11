@@ -1,0 +1,60 @@
+# Strategy 8: EMA Ribbon Pullback
+# Trend-following pullback to fanned 5-EMA ribbon (8, 13, 21, 34, 55).
+# Enters on confirmed bounce off fast EMAs when ribbon is fully fanned.
+
+strategy:
+  strategy_id: ema_ribbon_pullback
+  max_signals_per_day: 4
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [ema_ribbon, sma_trend, adx, relative_volume, atr, session_time]
+signal_configs:
+  ema_ribbon:
+    periods: [8, 13, 21, 34, 55]
+    atr_proximity: 1.0
+    atr_period: 14
+  sma_trend:
+    period: 200
+  adx:
+    period: 14
+    threshold: 22.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 10:00 AM - 3:30 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 600"
+  - signal: session_time
+    expr: "<= 930"
+  # EMA ribbon must be fanned AND price near ribbon
+  - signal: ema_ribbon
+    expr: passes
+  # ADX must show trending conditions
+  - signal: adx
+    expr: "> 22.0"
+  # Volume must be at least 0.7x average
+  - signal: relative_volume
+    expr: ">= 0.7"
+
+exit:
+  target:
+    type: atr_multiple
+    multiplier: 2.0
+  stop:
+    type: ema_21_buffer       # manual: ema_21 -/+ buffer
+    buffer: 0.50
+  time_stop_minutes: 30
+
+  # Early exit conditions -- any one triggers market exit (OR logic)
+  early_exit:
+    # Ribbon loses fanned state = trend weakening
+    - type: ribbon_unfanned
+    # Price closes beyond ema_34 against direction = pullback failed
+    - type: beyond_ema34

@@ -1,25 +1,28 @@
-"""HMM Intraday Regime Classifier.
+"""HMM Intraday Regime Classifier — 2-state, 3-feature, online-capable.
 
-Fits a 5-state Gaussian Hidden Markov Model on a subset of FeatureVector
-fields to classify intraday market regimes. States are semantically labeled
-via the Hungarian algorithm matching emission means to regime archetypes.
+3 features per bar: realized_vol, vpin_approx, return_autocorr.
+All z-score normalized with a 500-bar rolling window, clipped to [-3, 3].
 
 Usage:
     # Training (offline)
-    matrix, timestamps = build_feature_matrix(df_1s, config)
+    features, timestamps = build_feature_matrix(df_bars, config)
     clf = HMMRegimeClassifier(config)
-    clf.fit(matrix)
+    clf.fit(features)
+    clf.save("models/hmm/v4")
 
-    # Prediction (backtest)
-    states = clf.predict(matrix)
+    # Batch prediction (backtest)
+    states = clf.predict_sequence(features)
 
-    # Online (live)
-    state, proba = clf.predict_proba(last_50_bars_matrix)
+    # Online prediction (live)
+    state = clf.predict(bar_dict)          # returns int (0/1)
+    proba = clf.regime_proba(bar_dict)     # returns np.ndarray (2,)
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -29,28 +32,28 @@ import numpy as np
 import polars as pl
 from hmmlearn.hmm import GaussianHMM
 from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
 
+N_FEATURES = 3
+
+
+class NotReadyError(Exception):
+    """Raised when predict is called before warm-up buffer is saturated."""
+
 
 class RegimeState(IntEnum):
-    """Five intraday regime states."""
+    """Two intraday regime states."""
 
-    HIGH_VOL_UP = 0
-    HIGH_VOL_DOWN = 1
-    LOW_VOL_RANGE = 2
-    BREAKOUT = 3
-    MEAN_REVERSION = 4
+    RANGE_BOUND = 0   # Low vol, mean-reverting — good for VWAP reversion
+    VOLATILE = 1      # High vol / trending / crisis — avoid mean reversion
 
 
-# Feature column names used by the HMM (6 of 15+).
 DEFAULT_FEATURE_COLUMNS: list[str] = [
-    "atr_ticks",
-    "vwap_dev_sd",
-    "cvd_slope",
-    "poc_distance_ticks",
     "realized_vol",
-    "return_20bar",
+    "vpin_approx",
+    "return_autocorr",
 ]
 
 
@@ -58,50 +61,54 @@ DEFAULT_FEATURE_COLUMNS: list[str] = [
 class HMMRegimeConfig:
     """Configuration for the HMM regime classifier."""
 
-    n_states: int = 5
-    n_iter: int = 100
+    n_states: int = 2
+    n_iter: int = 200
     covariance_type: str = "full"
     random_state: int = 42
-    zscore_window: int = 250
-    feature_columns: list[str] = field(default_factory=lambda: list(DEFAULT_FEATURE_COLUMNS))
+    zscore_window: int = 500
+    warmup_bars: int = 500
+    rvol_window: int = 50
+    vpin_window: int = 50
+    autocorr_window: int = 30
+    predict_window: int = 100  # sliding window for online HMM predict
+    feature_columns: list[str] = field(
+        default_factory=lambda: list(DEFAULT_FEATURE_COLUMNS)
+    )
 
 
-# ── Feature matrix construction ──────────────────────────────────────
+# ── Vectorized helpers (batch mode) ─────────────────────────────────
 
 
-def _rolling_linreg_slope(arr: np.ndarray, window: int) -> np.ndarray:
-    """Vectorized rolling linear regression slope using cumulative sums."""
+def _rolling_autocorr(arr: np.ndarray, window: int = 30) -> np.ndarray:
+    """Vectorized rolling lag-1 Pearson autocorrelation of returns."""
     n = len(arr)
     result = np.full(n, np.nan, dtype=np.float64)
-    if n < window:
+    if n < window + 1:
         return result
 
-    # Precompute x constants for fixed window
-    x = np.arange(window, dtype=np.float64)
-    x_mean = x.mean()
-    x_var = np.sum((x - x_mean) ** 2)
-    if x_var == 0:
-        return result
-
-    # Sliding window via stride tricks
     from numpy.lib.stride_tricks import sliding_window_view
-    windows = sliding_window_view(arr, window)  # (n - window + 1, window)
-    y_means = windows.mean(axis=1)
-    # slope = sum((x - x_mean)(y - y_mean)) / sum((x - x_mean)^2)
-    slopes = np.sum((x[np.newaxis, :] - x_mean) * (windows - y_means[:, np.newaxis]), axis=1) / x_var
-    result[window - 1 :] = slopes
+
+    # curr[i] = arr[i-window+1 : i+1], prev[i] = arr[i-window : i]
+    curr = sliding_window_view(arr[1:], window)    # (n-1-window+1, window)
+    prev = sliding_window_view(arr[:-1], window)   # same shape
+
+    cm = curr - curr.mean(axis=1, keepdims=True)
+    pm = prev - prev.mean(axis=1, keepdims=True)
+
+    num = np.sum(cm * pm, axis=1)
+    denom = np.sqrt(np.sum(cm**2, axis=1) * np.sum(pm**2, axis=1))
+    denom = np.where(denom < 1e-10, 1.0, denom)
+
+    # First valid index: window (need window+1 data points incl. lag)
+    result[window:] = num / denom
     return result
 
 
 def _rolling_zscore(raw: np.ndarray, window: int) -> np.ndarray:
-    """Vectorized rolling z-score normalization (no lookahead).
-
-    Uses a fixed rolling window once enough data is available.
-    """
+    """Rolling z-score normalization, clipped to [-3, 3]."""
     n, k = raw.shape
     normed = np.full_like(raw, np.nan)
 
-    # Use Polars for fast rolling stats (operates column-wise)
     for col in range(k):
         series = pl.Series("v", raw[:, col])
         r_mean = series.rolling_mean(window_size=window, min_samples=2).to_numpy()
@@ -109,219 +116,350 @@ def _rolling_zscore(raw: np.ndarray, window: int) -> np.ndarray:
         r_std = np.where((r_std < 1e-10) | np.isnan(r_std), 1.0, r_std)
         normed[:, col] = (raw[:, col] - r_mean) / r_std
 
-    return normed
+    return np.clip(normed, -3.0, 3.0)
+
+
+# ── Batch feature extraction ────────────────────────────────────────
 
 
 def build_feature_matrix(
-    df_1s: pl.DataFrame,
+    df: pl.DataFrame,
     config: HMMRegimeConfig | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build the HMM feature matrix from 1s bars using vectorized operations.
+    """Build the HMM feature matrix from bar data using vectorized operations.
 
-    Computes 6 features: atr_ticks, vwap_dev_sd, cvd_slope, poc_distance_ticks,
-    realized_vol, return_20bar. All computed via Polars/NumPy — no row-by-row
-    Python loop, so it handles millions of bars efficiently.
+    Computes 3 features: realized_vol, vpin_approx, return_autocorr.
+    All z-score normalized with rolling window, clipped to [-3, 3].
 
     Returns:
-        (features, timestamps) where features is (N, 6) float64 and
-        timestamps is (N,) int64 nanosecond timestamps. Warm-up rows are dropped.
+        (features, timestamps) where features is (N, 3) float64 and
+        timestamps is (N,) int64 nanosecond timestamps. Warm-up rows dropped.
     """
     cfg = config or HMMRegimeConfig()
-    tick_size = 0.25
-    atr_period = 14
 
-    # Extract columns as numpy arrays
-    close = df_1s["close"].to_numpy().astype(np.float64)
-    high = df_1s["high"].to_numpy().astype(np.float64)
-    low = df_1s["low"].to_numpy().astype(np.float64)
-    open_ = df_1s["open"].to_numpy().astype(np.float64)
-    volume = df_1s["volume"].to_numpy().astype(np.float64)
+    close = df["close"].to_numpy().astype(np.float64)
+    open_ = df["open"].to_numpy().astype(np.float64)
+    volume = df["volume"].to_numpy().astype(np.float64)
     n = len(close)
 
-    # Timestamps — handle both datetime and int columns
-    ts_col = df_1s["timestamp"]
+    # Timestamps
+    ts_col = df["timestamp"]
     if ts_col.dtype == pl.Datetime or str(ts_col.dtype).startswith("Datetime"):
         ts_arr = ts_col.dt.epoch("ns").to_numpy().astype(np.int64)
     else:
         ts_arr = ts_col.to_numpy().astype(np.int64)
 
-    # ── 1. ATR in ticks (Wilder EWM of True Range) ──────────────────
-    prev_close = np.empty_like(close)
-    prev_close[0] = close[0]
-    prev_close[1:] = close[:-1]
-    tr = np.maximum(
-        high - low,
-        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)),
-    )
-    # Wilder smoothing via Polars ewm_mean (alpha = 1/period, adjust=False)
-    tr_series = pl.Series("tr", tr)
-    atr = tr_series.ewm_mean(alpha=1.0 / atr_period, adjust=False).to_numpy()
-    atr_ticks = atr / tick_size
-
-    # ── 2. VWAP deviation in standard deviations ────────────────────
-    typical = (high + low + close) / 3.0
-    cum_pv = np.cumsum(typical * volume)
-    cum_vol = np.cumsum(volume)
-    cum_vol_safe = np.where(cum_vol == 0, 1, cum_vol)
-    vwap = cum_pv / cum_vol_safe
-
-    # Rolling SD of (typical - vwap) using Polars
-    dev = typical - vwap
-    dev_series = pl.Series("dev", dev)
-    rolling_sd = dev_series.rolling_std(window_size=20, min_samples=2).to_numpy()
-    rolling_sd = np.where((rolling_sd < 1e-10) | np.isnan(rolling_sd), 1.0, rolling_sd)
-    vwap_dev_sd = dev / rolling_sd
-
-    # ── 3. CVD slope (20-bar linreg slope of bar deltas) ────────────
-    bar_delta = np.where(close > open_, volume, np.where(close < open_, -volume, 0.0))
-    cvd_slope = _rolling_linreg_slope(bar_delta, window=20)
-
-    # ── 4. POC distance in ticks (developing session POC) ───────────
-    # Approximate: rolling mode of rounded close prices over 390 bars (~1 session)
-    # Use volume-weighted price bucket to find local POC
-    poc_window = 390
-    poc_dist = np.zeros(n, dtype=np.float64)
-    # Vectorized approach: rolling volume-weighted mean as POC proxy
-    cum_cv = np.cumsum(close * volume)
-    poc_approx = np.where(cum_vol_safe > 0, cum_cv / cum_vol_safe, close)
-    poc_dist = np.abs(close - poc_approx) / tick_size
-
-    # ── 5. Realized vol (20-bar rolling std of log returns) ─────────
+    # Log returns
     log_ret = np.zeros(n, dtype=np.float64)
-    log_ret[1:] = np.log(np.maximum(close[1:], 1e-10) / np.maximum(close[:-1], 1e-10))
-    rvol_series = pl.Series("lr", log_ret)
-    realized_vol = rvol_series.rolling_std(window_size=20, min_samples=20).to_numpy()
-
-    # ── 6. 20-bar log return ────────────────────────────────────────
-    return_20bar = np.full(n, np.nan, dtype=np.float64)
-    return_20bar[20:] = np.log(
-        np.maximum(close[20:], 1e-10) / np.maximum(close[:-20], 1e-10)
+    log_ret[1:] = np.log(
+        np.maximum(close[1:], 1e-10) / np.maximum(close[:-1], 1e-10)
     )
 
-    # ── Stack raw features (N, 6) ───────────────────────────────────
-    raw_matrix = np.column_stack([
-        atr_ticks,
-        vwap_dev_sd,
-        cvd_slope,
-        poc_dist,
-        realized_vol,
-        return_20bar,
-    ])
+    # ── 1. Realized vol — rolling std of log returns ─────────────────
+    realized_vol = (
+        pl.Series("lr", log_ret)
+        .rolling_std(window_size=cfg.rvol_window, min_samples=2)
+        .to_numpy()
+    )
 
-    # ── Rolling z-score normalization ────────────────────────────────
-    normed = _rolling_zscore(raw_matrix, window=cfg.zscore_window)
+    # ── 2. VPIN approx — tick rule over rolling window ───────────────
+    buy_mask = close > open_
+    buy_vol = np.where(buy_mask, volume, 0.0)
+    sell_vol = np.where(~buy_mask, volume, 0.0)
+
+    buy_sum = (
+        pl.Series("bv", buy_vol)
+        .rolling_sum(window_size=cfg.vpin_window, min_samples=1)
+        .to_numpy()
+    )
+    sell_sum = (
+        pl.Series("sv", sell_vol)
+        .rolling_sum(window_size=cfg.vpin_window, min_samples=1)
+        .to_numpy()
+    )
+    total_sum = (
+        pl.Series("tv", volume)
+        .rolling_sum(window_size=cfg.vpin_window, min_samples=1)
+        .to_numpy()
+    )
+    total_safe = np.where(total_sum < 1, 1.0, total_sum)
+    vpin_approx = np.abs(buy_sum - sell_sum) / total_safe
+
+    # ── 3. Return autocorrelation — rolling lag-1 Pearson ────────────
+    return_autocorr = _rolling_autocorr(log_ret, window=cfg.autocorr_window)
+
+    # ── Stack raw features (N, 3) ────────────────────────────────────
+    raw = np.column_stack([realized_vol, vpin_approx, return_autocorr])
+
+    # ── Rolling z-score normalization, clip [-3, 3] ──────────────────
+    normed = _rolling_zscore(raw, window=cfg.zscore_window)
 
     # Drop warm-up rows
-    start = max(cfg.zscore_window, 20)
-    valid = ~np.any(np.isnan(normed[start:]), axis=1) & ~np.any(np.isinf(normed[start:]), axis=1)
+    start = cfg.zscore_window
+    valid = ~np.any(np.isnan(normed[start:]), axis=1) & ~np.any(
+        np.isinf(normed[start:]), axis=1
+    )
 
-    features = normed[start:][valid]
-    ts_out = ts_arr[start:][valid]
-
-    return features, ts_out
+    return normed[start:][valid], ts_arr[start:][valid]
 
 
 # ── HMM Classifier ──────────────────────────────────────────────────
 
 
 class HMMRegimeClassifier:
-    """Gaussian HMM regime classifier with semantic state labeling."""
+    """2-state Gaussian HMM regime classifier with online + batch prediction.
+
+    Stateful: maintains rolling windows internally for online bar-by-bar
+    prediction. Thread-safe via Lock around state mutations.
+    """
 
     def __init__(self, config: HMMRegimeConfig | None = None) -> None:
         self.config = config or HMMRegimeConfig()
         self.model: GaussianHMM | None = None
         self.state_map: dict[int, RegimeState] | None = None
-        self._norm_means: np.ndarray | None = None
-        self._norm_stds: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._reset_online_state()
 
-    def fit(self, features: np.ndarray) -> None:
-        """Fit the HMM on a (N, 6) feature matrix.
+    def _reset_online_state(self) -> None:
+        """Reset all rolling windows for online prediction."""
+        cfg = self.config
+        self._prev_close: float | None = None
+        self._log_returns: deque[float] = deque(maxlen=cfg.zscore_window + 1)
+        self._buy_vol_window: deque[float] = deque(maxlen=cfg.vpin_window)
+        self._sell_vol_window: deque[float] = deque(maxlen=cfg.vpin_window)
+        self._raw_features: deque[np.ndarray] = deque(maxlen=cfg.zscore_window)
+        self._zscored_window: deque[np.ndarray] = deque(maxlen=cfg.predict_window)
+        self._bar_count: int = 0
+        self._current_regime: RegimeState | None = None
+        self._last_proba: np.ndarray | None = None
+
+    def reset(self) -> None:
+        """Reset online state (call on session boundaries)."""
+        with self._lock:
+            self._reset_online_state()
+
+    # ── Training ─────────────────────────────────────────────────────
+
+    def fit(self, data: np.ndarray | list[dict]) -> None:
+        """Fit HMM on a (N, 3) feature matrix or list of bar dicts.
 
         Uses KMeans initialization for stable convergence, then relabels
         HMM states to semantic RegimeState values via Hungarian algorithm.
         """
+        if isinstance(data, list):
+            features = self._features_from_dicts(data)
+        else:
+            features = data
+
         cfg = self.config
+
+        # KMeans seeding for stable init
+        km = KMeans(
+            n_clusters=cfg.n_states,
+            random_state=cfg.random_state,
+            n_init=10,
+        )
+        km.fit(features)
+
         self.model = GaussianHMM(
             n_components=cfg.n_states,
             covariance_type=cfg.covariance_type,
             n_iter=cfg.n_iter,
             random_state=cfg.random_state,
-            init_params="stmc",
+            init_params="stc",  # skip 'm' — use KMeans means
         )
+        self.model.means_ = km.cluster_centers_
         self.model.fit(features)
         self._label_states()
         logger.info("HMM fitted: %d states, %d samples", cfg.n_states, len(features))
 
-    def _label_states(self) -> None:
-        """Map HMM component indices to semantic RegimeState via Hungarian algorithm.
+    def _features_from_dicts(self, bars: list[dict]) -> np.ndarray:
+        """Build feature matrix from list of bar dicts (for fit(bars) API)."""
+        df = pl.DataFrame({
+            "timestamp": list(range(len(bars))),
+            "open": [float(b["open"]) for b in bars],
+            "high": [float(b["high"]) for b in bars],
+            "low": [float(b["low"]) for b in bars],
+            "close": [float(b["close"]) for b in bars],
+            "volume": [float(b["volume"]) for b in bars],
+        })
+        features, _ = build_feature_matrix(df, self.config)
+        return features
 
-        Scoring heuristic based on emission means:
-        - HIGH_VOL_UP:    high ATR + positive return + positive CVD slope
-        - HIGH_VOL_DOWN:  high ATR + negative return + negative CVD slope
-        - LOW_VOL_RANGE:  low ATR + low VWAP deviation + low POC distance
-        - BREAKOUT:       moderate ATR + high POC distance + high realized vol
-        - MEAN_REVERSION: moderate ATR + high VWAP deviation (abs) + negative CVD×return
+    def _label_states(self) -> None:
+        """Map HMM components to semantic RegimeState via Hungarian algorithm.
+
+        Scoring heuristic for 2 states x 3 features:
+        - RANGE_BOUND:  low realized_vol, low vpin, negative return_autocorr
+        - VOLATILE:     high realized_vol, high vpin
         """
         assert self.model is not None
-        means = self.model.means_  # (n_states, n_features)
+        means = self.model.means_  # (n_states, 3)
 
-        # Feature indices: atr_ticks=0, vwap_dev_sd=1, cvd_slope=2,
-        #                  poc_distance_ticks=3, realized_vol=4, return_20bar=5
+        # Feature indices: realized_vol=0, vpin_approx=1, return_autocorr=2
         n_states = means.shape[0]
         n_regimes = len(RegimeState)
-
-        # Build cost matrix (negative score = better fit)
         cost = np.zeros((n_states, n_regimes), dtype=np.float64)
 
         for s in range(n_states):
-            m = means[s]
-            atr, vwap_dev, cvd_sl, poc_dist, rvol, ret20 = m
+            rvol, vpin, ret_ac = means[s]
 
-            # HIGH_VOL_UP: high ATR, positive return, positive CVD slope
-            cost[s, RegimeState.HIGH_VOL_UP] = -(atr + ret20 + cvd_sl)
+            # RANGE_BOUND: low vol, low informed flow, mean-reverting (negative autocorr)
+            cost[s, RegimeState.RANGE_BOUND] = -(-rvol - vpin - ret_ac)
 
-            # HIGH_VOL_DOWN: high ATR, negative return, negative CVD slope
-            cost[s, RegimeState.HIGH_VOL_DOWN] = -(atr - ret20 - cvd_sl)
+            # VOLATILE: high vol, high informed flow, trending
+            cost[s, RegimeState.VOLATILE] = -(rvol + vpin + ret_ac)
 
-            # LOW_VOL_RANGE: low ATR, small VWAP dev, small POC distance
-            cost[s, RegimeState.LOW_VOL_RANGE] = -(-atr - abs(vwap_dev) - poc_dist)
-
-            # BREAKOUT: high POC distance, high realized vol
-            cost[s, RegimeState.BREAKOUT] = -(poc_dist + rvol + abs(ret20))
-
-            # MEAN_REVERSION: high |VWAP dev|, CVD diverges from return
-            cost[s, RegimeState.MEAN_REVERSION] = -(abs(vwap_dev) - cvd_sl * ret20)
-
-        # Hungarian assignment (minimize cost = maximize score)
         row_ind, col_ind = linear_sum_assignment(cost)
-        self.state_map = {int(row): RegimeState(col) for row, col in zip(row_ind, col_ind)}
+        self.state_map = {
+            int(r): RegimeState(c) for r, c in zip(row_ind, col_ind)
+        }
 
-    def predict(self, features: np.ndarray) -> list[RegimeState]:
-        """Viterbi decoding: predict most likely regime sequence (offline/backtest)."""
+    # ── Online prediction ────────────────────────────────────────────
+
+    def _compute_online_features(self, bar: dict) -> np.ndarray | None:
+        """Ingest a bar and compute raw (un-normalized) feature vector.
+
+        Returns None if insufficient history for all features.
+        """
+        close = float(bar["close"])
+        open_ = float(bar["open"])
+        volume = float(bar["volume"])
+        cfg = self.config
+
+        # Log return
+        if self._prev_close is not None:
+            lr = np.log(max(close, 1e-10) / max(self._prev_close, 1e-10))
+        else:
+            lr = 0.0
+        self._prev_close = close
+        self._log_returns.append(lr)
+
+        # VPIN tracking
+        buy = volume if close > open_ else 0.0
+        sell = volume if close <= open_ else 0.0
+        self._buy_vol_window.append(buy)
+        self._sell_vol_window.append(sell)
+
+        self._bar_count += 1
+
+        # Need enough bars for all rolling windows
+        min_needed = max(cfg.rvol_window, cfg.autocorr_window + 1, 2)
+        if self._bar_count < min_needed:
+            return None
+
+        # 1. Realized vol — std of last rvol_window log returns
+        rets = list(self._log_returns)
+        recent = rets[-cfg.rvol_window:]
+        realized_vol = float(np.std(recent, ddof=1)) if len(recent) >= 2 else 0.0
+
+        # 2. VPIN approx
+        buy_sum = sum(self._buy_vol_window)
+        sell_sum = sum(self._sell_vol_window)
+        total = buy_sum + sell_sum
+        vpin = abs(buy_sum - sell_sum) / max(total, 1.0)
+
+        # 3. Return autocorrelation — lag-1 Pearson over autocorr_window
+        rets_arr = np.array(rets, dtype=np.float64)
+        if len(rets_arr) >= cfg.autocorr_window + 1:
+            curr = rets_arr[-cfg.autocorr_window:]
+            prev = rets_arr[-cfg.autocorr_window - 1 : -1]
+            cm = curr - curr.mean()
+            pm = prev - prev.mean()
+            denom = np.sqrt(float(np.sum(cm**2) * np.sum(pm**2)))
+            ret_autocorr = float(np.sum(cm * pm) / max(denom, 1e-10))
+        else:
+            ret_autocorr = 0.0
+
+        return np.array(
+            [realized_vol, vpin, ret_autocorr], dtype=np.float64
+        )
+
+    def _zscore_and_clip(self, raw: np.ndarray) -> np.ndarray | None:
+        """Z-score normalize against rolling history, clip to [-3, 3]."""
+        self._raw_features.append(raw)
+
+        if len(self._raw_features) < 2:
+            return None
+
+        history = np.array(self._raw_features)
+        means = history.mean(axis=0)
+        stds = history.std(axis=0, ddof=1)
+        stds = np.where(stds < 1e-10, 1.0, stds)
+
+        normed = (raw - means) / stds
+        return np.clip(normed, -3.0, 3.0)
+
+    def predict(self, bar: dict) -> int:
+        """Online: ingest one bar, update rolling state, return regime (0/1).
+
+        Raises NotReadyError if warm-up buffer (500 bars) not saturated.
+        """
+        with self._lock:
+            if self.model is None:
+                raise NotReadyError("Model not fitted")
+
+            raw = self._compute_online_features(bar)
+            if raw is None or self._bar_count < self.config.warmup_bars:
+                raise NotReadyError(
+                    f"Warm-up: {self._bar_count}/{self.config.warmup_bars} bars"
+                )
+
+            normed = self._zscore_and_clip(raw)
+            if normed is None:
+                raise NotReadyError("Insufficient z-score history")
+
+            self._zscored_window.append(normed)
+            window = np.array(self._zscored_window)  # (W, 4)
+
+            # Forward algorithm posteriors over sliding window
+            proba_matrix = self.model.predict_proba(window)
+            last_proba_raw = proba_matrix[-1]  # (n_components,)
+
+            # Map to RegimeState order
+            mapped_proba = np.zeros(len(RegimeState), dtype=np.float64)
+            for hmm_idx, regime in self.state_map.items():
+                mapped_proba[regime.value] = last_proba_raw[hmm_idx]
+
+            state = RegimeState(int(np.argmax(mapped_proba)))
+
+            # Log transitions
+            if self._current_regime is not None and state != self._current_regime:
+                logger.info(
+                    "regime_transition: %s -> %s",
+                    self._current_regime.name,
+                    state.name,
+                )
+            self._current_regime = state
+            self._last_proba = mapped_proba
+
+            return int(state)
+
+    def regime_proba(self, bar: dict) -> np.ndarray:
+        """Online: ingest one bar, return posterior probability vector (2,).
+
+        Raises NotReadyError if warm-up not complete.
+        """
+        self.predict(bar)  # updates internal state
+        return self._last_proba.copy()
+
+    @property
+    def last_proba(self) -> np.ndarray | None:
+        """Last computed posterior probabilities (or None if no prediction yet)."""
+        return self._last_proba
+
+    # ── Batch prediction (backtest) ──────────────────────────────────
+
+    def predict_sequence(self, features: np.ndarray) -> list[RegimeState]:
+        """Batch Viterbi decoding on pre-built (N, 3) feature matrix.
+
+        Use with build_feature_matrix() for backtest pipelines.
+        """
         assert self.model is not None and self.state_map is not None
         raw_states = self.model.predict(features)
         return [self.state_map[int(s)] for s in raw_states]
 
-    def predict_proba(self, feature_window: np.ndarray) -> tuple[RegimeState, np.ndarray]:
-        """Online prediction: pass a window of recent bars, return final row's state + probs.
-
-        Args:
-            feature_window: (W, 6) matrix of recent bars (e.g., last 50).
-
-        Returns:
-            (state, probabilities) where probabilities is (n_states,) mapped to RegimeState order.
-        """
-        assert self.model is not None and self.state_map is not None
-        posteriors = self.model.predict_proba(feature_window)
-        last_probs_raw = posteriors[-1]  # (n_components,)
-
-        # Reorder probabilities to RegimeState order
-        probs = np.zeros(len(RegimeState), dtype=np.float64)
-        for hmm_idx, regime in self.state_map.items():
-            probs[regime.value] = last_probs_raw[hmm_idx]
-
-        state = RegimeState(int(np.argmax(probs)))
-        return state, probs
+    # ── Persistence ──────────────────────────────────────────────────
 
     def save(self, path: str | Path) -> None:
         """Persist model, state map, and config to disk."""
@@ -351,11 +489,15 @@ class HMMRegimeClassifier:
 # ── Evaluation helpers ───────────────────────────────────────────────
 
 
-def compute_persistence_accuracy(states: list[RegimeState], horizon: int = 5) -> float:
+def compute_persistence_accuracy(
+    states: list[RegimeState], horizon: int = 5
+) -> float:
     """Fraction of time the regime at t is the same as at t + horizon."""
     if len(states) <= horizon:
         return 0.0
-    matches = sum(1 for i in range(len(states) - horizon) if states[i] == states[i + horizon])
+    matches = sum(
+        1 for i in range(len(states) - horizon) if states[i] == states[i + horizon]
+    )
     return matches / (len(states) - horizon)
 
 
@@ -387,9 +529,8 @@ def validate_model(
 ) -> HMMValidationReport:
     """Run full validation suite on a fitted classifier."""
     assert classifier.model is not None
-    states = classifier.predict(features)
+    states = classifier.predict_sequence(features)
 
-    # State distribution
     n = len(states)
     dist = {}
     for regime in RegimeState:

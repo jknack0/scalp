@@ -1,0 +1,54 @@
+# Strategy 11: Prior Day Level Fade
+# Fades price at PDH/PDL with rejection candle + RSI confirmation.
+# Target: 25% reversion toward PDC. Stop: 10 ticks beyond level.
+
+strategy:
+  strategy_id: pdh_pdl_fade
+  max_signals_per_day: 3
+  session_start: "09:30"
+  session_end: "16:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+# Signal pipeline: pre-computed per bar window
+signals: [prior_day_levels, prior_day_bias, rsi_momentum, volume_exhaustion, atr, relative_volume, session_time]
+signal_configs:
+  prior_day_levels:
+    proximity_points: 1.5
+  rsi_momentum:
+    period: 5
+    long_threshold: 40.0
+    short_threshold: 60.0
+
+# All entry gates are declarative filters
+filters:
+  # Time-of-day: 10:00 AM - 3:00 PM ET (minutes since midnight)
+  - signal: session_time
+    expr: ">= 600"
+  - signal: session_time
+    expr: "<= 900"
+  # Must be near PDH or PDL
+  - signal: prior_day_levels
+    expr: passes
+  # Volume exhaustion must pass
+  - signal: volume_exhaustion
+    expr: passes
+  # Relative volume >= 0.5x average
+  - signal: relative_volume
+    expr: ">= 0.5"
+
+exit:
+  time_stop_minutes: 20
+
+  # Early exit conditions — any one triggers market exit (OR logic)
+  early_exit:
+    # Price closes beyond PDH by 1.5 (shorts) or below PDL by 1.5 (longs)
+    - type: level_breach
+      breach_points: 1.5
+    # Adverse momentum — 2 bars moving 0.75x ATR against position
+    - type: adverse_momentum
+      bars: 2
+      atr_multiple: 0.75
