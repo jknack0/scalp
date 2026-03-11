@@ -49,8 +49,7 @@ class VWAPBandReversionStrategy:
         self._exit_builder = ExitBuilder.from_yaml(exit_cfg)
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 30)
 
-        # Parse early exit conditions from YAML (legacy)
-        self._early_exits = exit_cfg.get("early_exit", [])
+        # Legacy early_exit removed — ExitEngine handles all exit conditions
 
         # Build ExitEngine from declarative exits (new system)
         self.exit_engine = ExitEngine.from_list(config.get("exits"))
@@ -146,24 +145,6 @@ class VWAPBandReversionStrategy:
 
         target = geo.target_price
 
-        # Geometry sanity check
-        if direction == Direction.LONG:
-            if not (stop < entry_price < target):
-                logger.info("blocked_geometry",
-                            time=now.strftime("%H:%M"),
-                            direction="LONG", entry=entry_price,
-                            target=round(target, 2), stop=round(stop, 2),
-                            reason="stop >= entry or entry >= target")
-                return None
-        else:
-            if not (stop > entry_price > target):
-                logger.info("blocked_geometry",
-                            time=now.strftime("%H:%M"),
-                            direction="SHORT", entry=entry_price,
-                            target=round(target, 2), stop=round(stop, 2),
-                            reason="stop <= entry or entry <= target")
-                return None
-
         expiry = now + timedelta(minutes=self._time_stop_minutes)
 
         # Confidence based on deviation magnitude
@@ -190,6 +171,14 @@ class VWAPBandReversionStrategy:
             },
         )
 
+        valid, reason = signal.validate_geometry()
+        if not valid:
+            logger.info("blocked_geometry", time=now.strftime("%H:%M"),
+                        direction=direction.value, entry=entry_price,
+                        target=round(target, 2), stop=round(stop, 2),
+                        reason=reason)
+            return None
+
         self._signals_today += 1
         logger.info(
             "signal_generated",
@@ -206,66 +195,6 @@ class VWAPBandReversionStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string (e.g. "early:vwap_slope") or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "vwap_slope":
-            return self._check_vwap_slope_exit(cond, bundle, direction)
-
-        return None
-
-    def _check_vwap_slope_exit(
-        self, cond: dict, bundle: SignalBundle, direction: Direction
-    ) -> str | None:
-        """Exit if VWAP slope is moving against position direction.
-
-        Long trades need flat/rising VWAP; short trades need flat/falling.
-        If slope magnitude exceeds threshold AND direction is adverse, exit.
-        """
-        threshold = cond.get("threshold", 0.3)
-        vwap_result = bundle.get("vwap_session")
-        if vwap_result is None:
-            return None
-        slope = vwap_result.metadata.get("slope", 0.0)
-
-        # Long: adverse slope is negative (VWAP falling away from entry)
-        # Short: adverse slope is positive (VWAP rising away from entry)
-        if direction == Direction.LONG and slope < -threshold:
-            logger.info("early_exit_vwap_slope", direction="LONG", slope=round(slope, 4), threshold=threshold)
-            return "early:vwap_slope"
-        if direction == Direction.SHORT and slope > threshold:
-            logger.info("early_exit_vwap_slope", direction="SHORT", slope=round(slope, 4), threshold=threshold)
-            return "early:vwap_slope"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

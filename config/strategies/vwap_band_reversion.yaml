@@ -2,9 +2,11 @@
 # Mean reversion to VWAP when price deviates >=3.0 SD during range-bound sessions.
 # All entry gates are declarative filters evaluated by FilterEngine.
 #
-# Tuned 2026-03-11 exit sweep (Mar 2020 - Feb 2025, 5yr, ExitEngine + trailing stop):
-#   67 trades, 60% WR, Sharpe 1.24, PF 1.22, $360 net, DD 4.69%
-#   Exit mix: 42% TP, 27% hard stop, 10% trailing, 6% time, 10% early, 5% session
+# Tuned 2026-03-11 joint entry+exit sweep (Mar 2015 - Feb 2025, 10yr):
+#   64 trades, 70.3% WR, Sharpe 3.27, PF 2.04, $669 net, DD 1.79%
+#   Exit mix: 72% TP, 12% hard stop, 8% early, 8% session
+#   Key changes from v1: ADX <25→<20, stop 3→4x ATR, target 0.5→1.0 SD,
+#   time 30→45 bars, trailing stop disabled (no effect over 10yr)
 
 strategy:
   strategy_id: vwap_band_reversion
@@ -41,43 +43,37 @@ filters:
   # VWAP slope must be flat (non-trending intraday)
   - signal: vwap_session
     field: slope
-    expr: "abs <= 0.3"
+    expr: "abs <= 0.5"
   # Price must be >= 3.0 SD from VWAP
   - signal: vwap_session
     field: deviation_sd
     expr: "abs >= 3.0"
-  # ADX must be below 25 (non-strongly-trending)
+  # ADX must be below 20 (truly range-bound — tightened from <25)
   - signal: adx
-    expr: "< 25.0"
-  # Volume must be >= 0.5x average
+    expr: "< 20.0"
+  # Volume must be >= 0.3x average
   - signal: relative_volume
-    expr: ">= 0.5"
+    expr: ">= 0.3"
   # HMM regime: only trade in range-bound
   - signal: hmm_regime
     expr: passes
 
 # Declarative exits — evaluated by ExitEngine each bar (OR logic)
-# Priority order: stops first, then targets, then trailing, then early exits
 exits:
-  # Hard stop: 3.0 x ATR from fill price
+  # Hard stop: 4.0 x ATR from fill price (widened from 3.0)
   - type: static_stop
     enabled: true
-    atr_multiple: 3.0
-  # Take profit: price reverts to within 0.5 SD of VWAP
+    atr_multiple: 4.0
+  # Take profit: price reverts to within 1.0 SD of VWAP (widened from 0.5)
   - type: vwap_reversion_target
     enabled: true
-    target_sd_band: 0.5
+    target_sd_band: 1.0
     vwap_signal: vwap_session
     deviation_field: deviation_sd
-  # Trailing stop: locks in profit on overachievers (1.5x ATR trail, activates at 4 ticks)
-  - type: trailing_stop
-    enabled: true
-    atr_multiple: 1.5
-    activate_after_ticks: 4
-  # Time stop: exit after 30 bars (= 150 min on 5m bars)
+  # Time stop: exit after 45 bars (= 225 min on 5m bars, extended from 30)
   - type: time_stop
     enabled: true
-    max_bars: 30
+    max_bars: 45
   # VWAP slope going adverse = trend developing against us
   - type: adverse_signal_exit
     enabled: true
@@ -99,5 +95,5 @@ exit:
     type: vwap
   stop:
     type: atr_multiple
-    multiplier: 3.0
-  time_stop_minutes: 150
+    multiplier: 4.0
+  time_stop_minutes: 225

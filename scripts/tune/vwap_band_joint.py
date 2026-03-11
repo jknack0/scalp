@@ -43,18 +43,18 @@ def p(msg):
     print(msg, flush=True)
 
 
-# ── COARSE GRID ──
+# ── REFINED GRID (zoom into winners from coarse sweep) ──
 # Entry filter thresholds
-GRID_DEV_SD   = [2.0, 3.0, 4.0]       # abs deviation_sd >= X
-GRID_SLOPE    = [0.2, 0.5]             # abs slope <= X
-GRID_ADX      = [20.0, 30.0]           # adx < X
-GRID_RVOL     = [0.3, 1.0]             # relative_volume >= X
+GRID_DEV_SD   = [2.5, 3.0, 3.5]       # abs deviation_sd >= X
+GRID_SLOPE    = [0.3, 0.5]             # abs slope <= X
+GRID_ADX      = [15.0, 18.0, 20.0, 22.0]  # adx < X — biggest factor
+GRID_RVOL     = [0.3]                  # not sensitive — lock at 0.3
 
 # Exit params
-GRID_STOP_ATR = [2.0, 4.0]             # hard stop ATR multiple
-GRID_TGT_SD   = [0.3, 1.0]            # reversion target SD band
-GRID_TIME     = [15, 45]               # time stop bars
-GRID_TRAIL    = [(0, 0), (1.5, 4)]     # (atr_mult, activate_ticks) — 0=off
+GRID_STOP_ATR = [3.0, 4.0, 5.0]       # wider stops won coarse sweep
+GRID_TGT_SD   = [0.7, 1.0, 1.3]       # wider TP won coarse sweep
+GRID_TIME     = [30, 45, 60]           # longer time won coarse sweep
+GRID_TRAIL    = [(0, 0)]                # no effect in coarse sweep — lock off
 
 # Fixed params
 SLOPE_EXIT_THRESH = 0.5                 # adverse slope exit threshold

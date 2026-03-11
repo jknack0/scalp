@@ -54,6 +54,19 @@ class Signal:
     metadata: dict = field(default_factory=dict)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
+    def validate_geometry(self) -> tuple[bool, str]:
+        """Check that stop/entry/target are in correct order for direction.
+
+        Returns (is_valid, reason).  Reason is empty string when valid.
+        """
+        if self.direction == Direction.LONG:
+            if not (self.stop_price < self.entry_price < self.target_price):
+                return False, "LONG: need stop < entry < target"
+        else:
+            if not (self.stop_price > self.entry_price > self.target_price):
+                return False, "SHORT: need stop > entry > target"
+        return True, ""
+
     @property
     def risk_reward_ratio(self) -> float:
         """Reward / risk in price distance. Returns 0 if risk is zero."""
