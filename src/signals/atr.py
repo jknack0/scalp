@@ -9,12 +9,15 @@ Ported from src/features/atr.py into the stateless signal framework.
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 from dataclasses import dataclass
 
 from src.core.events import BarEvent
 from src.signals.base import SignalBase, SignalResult
 from src.signals.registry import SignalRegistry
+
+_logger = logging.getLogger(__name__)
 
 MES_TICK_SIZE = 0.25
 
@@ -33,6 +36,7 @@ class ATRSignal(SignalBase):
 
     def __init__(self, config: ATRConfig | None = None) -> None:
         self.config = config or ATRConfig()
+        self._compute_count: int = 0
 
     def compute(self, bars: list[BarEvent]) -> SignalResult:
         """Compute Wilder-smoothed ATR and vol regime from bar history.
@@ -105,6 +109,25 @@ class ATRSignal(SignalBase):
 
         current_atr = float(atr_series[-1])
         atr_ticks = current_atr / MES_TICK_SIZE
+
+        # Debug logging for first 3 computes to diagnose inflated ATR
+        self._compute_count += 1
+        if self._compute_count <= 3:
+            gaps_detected = sum(
+                1 for i in range(1, n)
+                if bars[i].timestamp_ns - bars[i - 1].timestamp_ns > self._max_gap_ns
+            )
+            _logger.info(
+                "ATR_DEBUG n_bars=%d gap_threshold_min=%.1f gaps_detected=%d "
+                "atr_raw=%.4f atr_ticks=%.1f max_tr=%.4f median_tr=%.4f",
+                n,
+                self._max_gap_ns / 60e9,
+                gaps_detected,
+                current_atr,
+                atr_ticks,
+                float(np.max(true_ranges)),
+                float(np.median(true_ranges)),
+            )
 
         # ----------------------------------------------------------
         # 3. Vol regime via percentile rank

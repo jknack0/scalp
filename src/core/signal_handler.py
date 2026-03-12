@@ -331,7 +331,8 @@ class SignalHandler:
             elif name == "adx":
                 snap["adx"] = round(result.value, 1)
             elif name == "atr":
-                snap["atr"] = round(result.metadata.get("atr_raw", 0), 2)
+                snap["atr"] = round(result.metadata.get("atr_ticks", 0), 1)
+                snap["atr_raw"] = round(result.metadata.get("atr_raw", 0), 4)
             elif name == "relative_volume":
                 snap["rvol"] = round(result.value, 2)
 
