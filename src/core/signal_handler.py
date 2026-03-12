@@ -94,6 +94,7 @@ class SignalHandler:
         try:
             import databento as db
             import polars as pl
+            import time as _time
             from datetime import datetime, timedelta, timezone
             from src.core.bar_resampler import _freq_to_seconds
 
@@ -110,17 +111,25 @@ class SignalHandler:
             # Continuous front-month (e.g. MES.c.0)
             root = symbol[:3] if len(symbol) > 3 else symbol
 
-            data = client.timeseries.get_range(
-                dataset="GLBX.MDP3",
-                symbols=f"{root}.c.0",
-                stype_in="continuous",
-                schema="ohlcv-1m",
-                start=start.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                end=end.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-            )
-
-            df = data.to_df()
-            if df.empty:
+            # Retry up to 3 times (Databento gateway can be flaky)
+            df = None
+            for attempt in range(3):
+                try:
+                    data = client.timeseries.get_range(
+                        dataset="GLBX.MDP3",
+                        symbols=f"{root}.c.0",
+                        stype_in="continuous",
+                        schema="ohlcv-1m",
+                        start=start.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                        end=end.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                    )
+                    df = data.to_df()
+                    break
+                except Exception as e:
+                    logger.warning("warmup_retry", attempt=attempt + 1, error=str(e))
+                    if attempt < 2:
+                        _time.sleep(5)
+            if df is None or df.empty:
                 logger.info("warmup_no_data", symbol=symbol)
                 return
 
