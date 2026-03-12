@@ -160,9 +160,13 @@ async def main() -> None:
     )
     handler.wire()
 
-    # Warm up signals from historical bars in Postgres
-    if os.environ.get("DATABASE_URL"):
-        handler.warmup_from_postgres(symbol=config.symbol, bars=500)
+    # Warm up signals from Databento historical bars
+    if config.databento_api_key:
+        handler.warmup_from_databento(
+            symbol=config.symbol,
+            api_key=config.databento_api_key,
+            bars=600,
+        )
 
     # ── Tick aggregator (ticks → bars) ───────────────────────
     aggregator = TickAggregator(

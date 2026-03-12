@@ -68,63 +68,79 @@ class SignalHandler:
             paper=self._oms.is_paper,
         )
 
-    def warmup_from_postgres(self, symbol: str, bars: int = 500) -> None:
-        """Pre-feed historical bars from Postgres to warm up signals.
+    def warmup_from_databento(self, symbol: str, api_key: str, bars: int = 600) -> None:
+        """Pre-feed historical bars from Databento to warm up signals.
 
-        Reads the last N 1m bars from bars_1m, converts to BarEvents,
-        and runs the signal engine on them so regime detector, ADX, ATR,
-        VWAP, etc. all have context on first live bar.
+        Pulls the last N 1m OHLCV bars via Databento Historical API,
+        converts to BarEvents, and runs the signal engine on them so
+        regime detector, ADX, ATR, VWAP, etc. all have context on first
+        live bar.
+
+        The regime detector needs ~500+ bars (hurst_window=250, warmup_bars=300,
+        zscore_window=500), so default is 600 bars (~10 hours of 1m data).
         """
-        import os
-        dsn = os.environ.get("DATABASE_URL", "")
-        if not dsn:
-            return
         if self._signal_engine is None:
+            return
+        if not api_key:
+            logger.warning("warmup_skip", reason="no DATABENTO_API_KEY")
             return
 
         try:
-            import psycopg2
-            conn = psycopg2.connect(dsn)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT timestamp, open, high, low, close, volume "
-                    "FROM bars_1m WHERE symbol = %s "
-                    "ORDER BY timestamp DESC LIMIT %s",
-                    (symbol, bars),
-                )
-                rows = cur.fetchall()
-            conn.close()
-        except Exception as e:
-            logger.warning("warmup_db_error", error=str(e))
-            return
+            import databento as db
+            from datetime import datetime, timedelta, timezone
 
-        if not rows:
-            logger.info("warmup_no_data", symbol=symbol)
-            return
+            client = db.Historical(key=api_key)
 
-        # Rows are DESC, reverse to chronological
-        rows.reverse()
+            # Pull recent 1m bars — request extra time window to account
+            # for overnight gaps and weekend closures
+            end = datetime.now(timezone.utc) - timedelta(minutes=30)  # Databento lags ~15-20 min
+            start = end - timedelta(minutes=bars * 3)
 
-        # Convert to BarEvents and feed to signal engine
-        for ts, o, h, l, c, vol in rows:
-            bar = BarEvent(
-                symbol=symbol,
-                open=o, high=h, low=l, close=c,
-                volume=vol,
-                bar_type="1m",
-                timestamp_ns=int(ts.timestamp() * 1e9),
+            # Continuous front-month (e.g. MES.c.0)
+            root = symbol[:3] if len(symbol) > 3 else symbol
+
+            data = client.timeseries.get_range(
+                dataset="GLBX.MDP3",
+                symbols=f"{root}.c.0",
+                stype_in="continuous",
+                schema="ohlcv-1m",
+                start=start.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                end=end.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
             )
-            self._bar_window.append(bar)
 
-        # Trim to max window
-        if len(self._bar_window) > 500:
-            self._bar_window = self._bar_window[-500:]
+            df = data.to_df()
+            if df.empty:
+                logger.info("warmup_no_data", symbol=symbol)
+                return
 
-        # Run signal engine once on the full window to warm up all signals
-        self._signal_engine.compute(self._bar_window)
+            # Take last N bars
+            df = df.tail(bars)
 
-        logger.info("warmup_complete", bars_loaded=len(rows),
-                     window_size=len(self._bar_window))
+            for _, row in df.iterrows():
+                bar = BarEvent(
+                    symbol=symbol,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=int(row["volume"]),
+                    bar_type="1m",
+                    timestamp_ns=int(row.name.timestamp() * 1e9),
+                )
+                self._bar_window.append(bar)
+
+            # Trim to max window
+            if len(self._bar_window) > 500:
+                self._bar_window = self._bar_window[-500:]
+
+            # Run signal engine once on the full window to warm up all signals
+            self._signal_engine.compute(self._bar_window)
+
+            logger.info("warmup_complete", bars_loaded=len(df),
+                         window_size=len(self._bar_window))
+
+        except Exception as e:
+            logger.warning("warmup_databento_error", error=str(e))
 
     async def on_tick(self, tick: TickEvent) -> None:
         """Forward ticks to OMS for paper bracket monitoring."""
