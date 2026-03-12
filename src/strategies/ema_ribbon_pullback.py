@@ -46,9 +46,6 @@ class EmaRibbonPullbackStrategy:
         self._target_atr_multiple: float = exit_cfg.get("target", {}).get("multiplier", 2.0)
         self._stop_buffer: float = exit_cfg.get("stop", {}).get("buffer", 0.50)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -261,79 +258,6 @@ class EmaRibbonPullbackStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "ribbon_unfanned":
-            return self._check_ribbon_unfanned_exit(cond, bundle)
-
-        if exit_type == "beyond_ema34":
-            return self._check_beyond_ema34_exit(cond, bar, bundle, direction)
-
-        return None
-
-    def _check_ribbon_unfanned_exit(
-        self, cond: dict, bundle: SignalBundle
-    ) -> str | None:
-        """Exit if EMA ribbon is no longer fanned."""
-        ribbon_result = bundle.get("ema_ribbon")
-        if ribbon_result is None:
-            return None
-        fanned = ribbon_result.metadata.get("fanned", False)
-        if not fanned:
-            logger.info("early_exit_ribbon_unfanned")
-            return "early:ribbon_unfanned"
-        return None
-
-    def _check_beyond_ema34_exit(
-        self, cond: dict, bar: BarEvent, bundle: SignalBundle, direction: Direction
-    ) -> str | None:
-        """Exit if price closes beyond ema_34 against direction."""
-        ribbon_result = bundle.get("ema_ribbon")
-        if ribbon_result is None:
-            return None
-        ema_34 = ribbon_result.metadata.get("ema_34", 0.0)
-        if ema_34 == 0.0:
-            return None
-
-        if direction == Direction.LONG and bar.close < ema_34:
-            logger.info("early_exit_beyond_ema34", direction="LONG",
-                        close=bar.close, ema_34=round(ema_34, 2))
-            return "early:beyond_ema34"
-        if direction == Direction.SHORT and bar.close > ema_34:
-            logger.info("early_exit_beyond_ema34", direction="SHORT",
-                        close=bar.close, ema_34=round(ema_34, 2))
-            return "early:beyond_ema34"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

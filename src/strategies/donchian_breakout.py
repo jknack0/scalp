@@ -44,9 +44,6 @@ class DonchianBreakoutStrategy:
         exit_cfg = config.get("exit", {})
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 45)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -197,109 +194,6 @@ class DonchianBreakoutStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "donchian_trail":
-            return self._check_donchian_trail_exit(bar, bundle, direction, fill_price)
-
-        if exit_type == "adx_collapse":
-            return self._check_adx_collapse_exit(cond, bundle)
-
-        return None
-
-    def _check_donchian_trail_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Trailing stop via 10-bar exit channel.
-
-        LONG: trail stop up using exit_lower. Exit if bar.close < max(initial_stop, exit_lower).
-        SHORT: trail stop down using exit_upper. Exit if bar.close > min(initial_stop, exit_upper).
-
-        The initial_stop is stored in the signal metadata at entry time and
-        passed through the fill_price context. We retrieve the donchian exit
-        channel from the current bundle.
-        """
-        donchian_result = bundle.get("donchian_channel")
-        if donchian_result is None:
-            return None
-
-        meta = donchian_result.metadata
-        exit_lower = meta.get("exit_lower", 0.0)
-        exit_upper = meta.get("exit_upper", 0.0)
-
-        # We need the initial stop from entry. The backtest engine passes
-        # signal metadata through; we use the signal's stop_price as the
-        # initial_stop baseline. Since fill_price is the entry price, we
-        # can reconstruct from the ATR stored in metadata if needed.
-        # However, the simpler approach: the trailing stop only tightens,
-        # never loosens. We compare bar.close against the exit channel.
-
-        if direction == Direction.LONG:
-            # For longs, exit_lower acts as trailing stop (only moves up)
-            # Exit if price drops below exit_lower
-            if bar.close < exit_lower:
-                logger.info("early_exit_donchian_trail", direction="LONG",
-                            close=bar.close, exit_lower=round(exit_lower, 2))
-                return "early:donchian_trail"
-        else:
-            # For shorts, exit_upper acts as trailing stop (only moves down)
-            # Exit if price rises above exit_upper
-            if bar.close > exit_upper:
-                logger.info("early_exit_donchian_trail", direction="SHORT",
-                            close=bar.close, exit_upper=round(exit_upper, 2))
-                return "early:donchian_trail"
-
-        return None
-
-    def _check_adx_collapse_exit(
-        self, cond: dict, bundle: SignalBundle
-    ) -> str | None:
-        """Exit if ADX drops below threshold — trend is dying."""
-        threshold = cond.get("threshold", 15.0)
-        adx_result = bundle.get("adx")
-        if adx_result is None:
-            return None
-
-        if adx_result.value < threshold:
-            logger.info("early_exit_adx_collapse",
-                        adx=round(adx_result.value, 1),
-                        threshold=threshold)
-            return "early:adx_collapse"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

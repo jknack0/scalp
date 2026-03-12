@@ -48,16 +48,23 @@ filters:
 
 exit:
   target:
-    type: sd_band           # target = VWAP ± 1 SD toward VWAP
+    type: sd_band
     multiplier: 1.0
   stop:
-    type: atr_multiple       # stop = entry ± 1.5 ATR
+    type: atr_multiple
     multiplier: 1.5
   time_stop_minutes: 10
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # Adverse momentum — 2 bars moving 1.0x ATR against position
-    - type: adverse_momentum
-      bars: 2
-      atr_multiple: 1.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 10
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 1.0
+    max_bars: 2

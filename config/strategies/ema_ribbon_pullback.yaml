@@ -52,9 +52,24 @@ exit:
     buffer: 0.50
   time_stop_minutes: 30
 
-  # Early exit conditions -- any one triggers market exit (OR logic)
-  early_exit:
-    # Ribbon loses fanned state = trend weakening
-    - type: ribbon_unfanned
-    # Price closes beyond ema_34 against direction = pullback failed
-    - type: beyond_ema34
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 6
+  # Ribbon loses fanned state = trend weakening
+  - type: signal_bound_exit
+    enabled: true
+    signal: ema_ribbon
+    field: is_fanned
+    upper_bound: 0.5
+  # Price closes beyond ema_34 against direction = pullback failed
+  - type: price_vs_signal_exit
+    enabled: true
+    signal: ema_ribbon
+    long_field: ema_34
+    short_field: ema_34

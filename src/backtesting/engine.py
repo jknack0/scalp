@@ -291,6 +291,9 @@ class SimulatedOMS:
         hmm_result = bundle.get("hmm_regime")
         if hmm_result is not None:
             snapshot["hmm_regime"] = int(hmm_result.value)
+        # Bracket prices from Signal for BracketTarget/BracketStop conditions
+        snapshot["target_price"] = order.target_price
+        snapshot["stop_price"] = order.stop_price
         # Also copy any metadata from the signal itself
         if order.signal.metadata:
             for key, val in order.signal.metadata.items():
@@ -441,6 +444,25 @@ class SimulatedOMS:
                             order, bar_index, bar_time, bar_date, current_atr_ticks,
                             reason="target", use_slippage=False,
                         )
+
+            if reason == "stop:bracket_stop":
+                # Bracket stop hit — fill at original Signal stop price
+                stop_price = order.entry_snapshot.get("stop_price", 0.0)
+                if stop_price > 0:
+                    return self._fill_exit(
+                        order, bar_index, bar_time, bar_date, current_atr_ticks,
+                        reason=reason, use_slippage=True, market_price=stop_price,
+                    )
+
+            if reason == "tp:bracket_target":
+                # Bracket target hit — fill at original Signal target price
+                target_price = order.entry_snapshot.get("target_price", 0.0)
+                if target_price > 0:
+                    order.target_price = target_price
+                    return self._fill_exit(
+                        order, bar_index, bar_time, bar_date, current_atr_ticks,
+                        reason="target", use_slippage=False,
+                    )
 
             if reason == "tp:reversion_target":
                 # VWAP reversion target hit — fill at VWAP price, no slippage

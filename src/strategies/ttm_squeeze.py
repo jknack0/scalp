@@ -60,9 +60,6 @@ class TTMSqueezeStrategy:
         self._exit_builder = ExitBuilder.from_yaml(exit_cfg)
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 30)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -249,125 +246,6 @@ class TTMSqueezeStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "keltner_reentry":
-            return self._check_keltner_reentry_exit(cond, bar, bundle, bars_in_trade, direction)
-
-        if exit_type == "adverse_momentum":
-            return self._check_adverse_momentum_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-
-        return None
-
-    def _check_keltner_reentry_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-    ) -> str | None:
-        """Exit if price re-enters Keltner Channel within max_bars of entry.
-
-        For LONG: exit if close < keltner upper (fell back inside channel).
-        For SHORT: exit if close > keltner lower (rose back inside channel).
-        """
-        max_bars = cond.get("bars", 3)
-
-        if bars_in_trade > max_bars:
-            return None  # Only applies to early bars
-
-        kelt_result = bundle.get("keltner_channel")
-        if kelt_result is None:
-            return None
-
-        kelt_meta = kelt_result.metadata
-        kelt_upper = kelt_meta.get("upper", 0.0)
-        kelt_lower = kelt_meta.get("lower", 0.0)
-
-        if direction == Direction.LONG and bar.close < kelt_upper:
-            logger.info("early_exit_keltner_reentry",
-                        direction="LONG", close=bar.close,
-                        kelt_upper=round(kelt_upper, 2),
-                        bars_in_trade=bars_in_trade)
-            return "early:keltner_reentry"
-
-        if direction == Direction.SHORT and bar.close > kelt_lower:
-            logger.info("early_exit_keltner_reentry",
-                        direction="SHORT", close=bar.close,
-                        kelt_lower=round(kelt_lower, 2),
-                        bars_in_trade=bars_in_trade)
-            return "early:keltner_reentry"
-
-        return None
-
-    def _check_adverse_momentum_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Exit if unrealized loss exceeds ATR multiple within first N bars."""
-        max_bars = cond.get("bars", 2)
-        atr_mult = cond.get("atr_multiple", 1.0)
-
-        if bars_in_trade > max_bars:
-            return None
-
-        atr_result = bundle.get("atr")
-        if atr_result is None:
-            return None
-        atr_raw = atr_result.metadata.get("atr_raw", 0.0)
-        if atr_raw <= 0:
-            return None
-
-        if direction == Direction.LONG:
-            unrealized = bar.close - fill_price
-        else:
-            unrealized = fill_price - bar.close
-
-        threshold = -atr_mult * atr_raw
-        if unrealized < threshold:
-            logger.info("early_exit_adverse_momentum",
-                        direction=direction.value,
-                        bars_in_trade=bars_in_trade,
-                        unrealized=round(unrealized, 2),
-                        threshold=round(threshold, 2))
-            return "early:adverse_momentum"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

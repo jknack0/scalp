@@ -50,6 +50,9 @@ Supported exit types:
     adverse_signal_exit        — Exit when a signal field flips adverse
     regime_exit                — Exit when HMM regime becomes hostile
     volatility_expansion_exit  — Exit when ATR expands beyond entry ATR × multiple
+    adverse_momentum           — Exit if unrealized loss exceeds ATR/points threshold
+    signal_bound_exit          — Exit if signal outside [lower, upper] bounds
+    price_vs_signal_exit       — Exit if price crosses dynamic signal-derived level
 """
 
 from __future__ import annotations
@@ -346,6 +349,201 @@ class VolatilityExpansionExit(ExitCondition):
         return None
 
 
+class BracketTarget(ExitCondition):
+    """Exit at the Signal's original target_price (from ExitBuilder geometry).
+
+    Reads target_price from entry_snapshot, which is captured at fill time
+    from the Signal object. Works with any ExitBuilder geometry type
+    (or_width, sd_band, fixed_ticks, atr_multiple, etc.).
+
+    YAML:
+        - type: bracket_target
+          enabled: true
+    """
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        pass
+
+    @property
+    def exit_type(self) -> str:
+        return "tp:bracket_target"
+
+    def evaluate(self, ctx: ExitContext) -> str | None:
+        target = ctx.entry_snapshot.get("target_price", 0.0)
+        if target == 0.0:
+            return None
+        if ctx.direction == "LONG" and ctx.bar.high >= target:
+            return self.exit_type
+        if ctx.direction == "SHORT" and ctx.bar.low <= target:
+            return self.exit_type
+        return None
+
+
+class BracketStop(ExitCondition):
+    """Exit at the Signal's original stop_price (from ExitBuilder geometry).
+
+    YAML:
+        - type: bracket_stop
+          enabled: true
+    """
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        pass
+
+    @property
+    def exit_type(self) -> str:
+        return "stop:bracket_stop"
+
+    def evaluate(self, ctx: ExitContext) -> str | None:
+        stop = ctx.entry_snapshot.get("stop_price", 0.0)
+        if stop == 0.0:
+            return None
+        if ctx.direction == "LONG" and ctx.bar.low <= stop:
+            return self.exit_type
+        if ctx.direction == "SHORT" and ctx.bar.high >= stop:
+            return self.exit_type
+        return None
+
+
+class AdverseMomentum(ExitCondition):
+    """Exit if unrealized loss exceeds threshold within first N bars.
+
+    YAML:
+        - type: adverse_momentum
+          enabled: true
+          atr_multiple: 1.0        # exit if loss > 1.0x ATR
+          max_bars: 3              # only check in first 3 bars (0 = always)
+          threshold_points: 0      # alternative: fixed points instead of ATR
+    """
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        self.atr_multiple = float(cfg.get("atr_multiple", 1.0))
+        self.max_bars = int(cfg.get("max_bars", 0))
+        self.threshold_points = float(cfg.get("threshold_points", 0.0))
+
+    @property
+    def exit_type(self) -> str:
+        return "early:adverse_momentum"
+
+    def evaluate(self, ctx: ExitContext) -> str | None:
+        if self.max_bars > 0 and ctx.bars_in_trade > self.max_bars:
+            return None
+
+        if self.threshold_points > 0:
+            threshold = self.threshold_points
+        else:
+            atr = ctx.entry_snapshot.get("atr", 0.0)
+            if atr <= 0:
+                return None
+            threshold = atr * self.atr_multiple
+
+        if ctx.direction == "LONG":
+            loss = ctx.fill_price - ctx.bar.close
+        else:
+            loss = ctx.bar.close - ctx.fill_price
+
+        if loss > threshold:
+            return self.exit_type
+        return None
+
+
+class SignalBoundExit(ExitCondition):
+    """Exit if a signal value goes outside [lower, upper] bounds.
+
+    Non-directional: fires for both LONG and SHORT positions.
+
+    YAML:
+        - type: signal_bound_exit
+          enabled: true
+          signal: adx
+          field: null            # optional: read from metadata field
+          upper_bound: 30.0      # exit if value > 30 (null = don't check)
+          lower_bound: null      # exit if value < X (null = don't check)
+    """
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        self.signal_name = cfg.get("signal", "")
+        self.field_name = cfg.get("field", None)
+        self.upper_bound = cfg.get("upper_bound", None)
+        self.lower_bound = cfg.get("lower_bound", None)
+        if self.upper_bound is not None:
+            self.upper_bound = float(self.upper_bound)
+        if self.lower_bound is not None:
+            self.lower_bound = float(self.lower_bound)
+
+    @property
+    def exit_type(self) -> str:
+        suffix = self.signal_name
+        if self.field_name:
+            suffix += f"_{self.field_name}"
+        return f"early:bound_{suffix}"
+
+    def evaluate(self, ctx: ExitContext) -> str | None:
+        result = ctx.bundle.get(self.signal_name)
+        if result is None:
+            return None
+
+        if self.field_name:
+            value = result.metadata.get(self.field_name)
+            if value is None:
+                return None
+            value = float(value)
+        else:
+            value = result.value
+
+        if self.upper_bound is not None and value > self.upper_bound:
+            return self.exit_type
+        if self.lower_bound is not None and value < self.lower_bound:
+            return self.exit_type
+        return None
+
+
+class PriceVsSignalExit(ExitCondition):
+    """Exit if price crosses a dynamic signal-derived level.
+
+    Used for: keltner reentry, donchian trailing, beyond-EMA, level breaches.
+
+    YAML:
+        - type: price_vs_signal_exit
+          enabled: true
+          signal: keltner_channel
+          long_field: upper       # LONG exits if close < signal.metadata[upper]
+          short_field: lower      # SHORT exits if close > signal.metadata[lower]
+          offset: 0.0             # points offset (positive = more room before exit)
+          max_bars: 0             # only check in first N bars (0 = always)
+    """
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        self.signal_name = cfg.get("signal", "")
+        self.long_field = cfg.get("long_field", None)
+        self.short_field = cfg.get("short_field", None)
+        self.offset = float(cfg.get("offset", 0.0))
+        self.max_bars = int(cfg.get("max_bars", 0))
+
+    @property
+    def exit_type(self) -> str:
+        return f"early:price_vs_{self.signal_name}"
+
+    def evaluate(self, ctx: ExitContext) -> str | None:
+        if self.max_bars > 0 and ctx.bars_in_trade > self.max_bars:
+            return None
+
+        result = ctx.bundle.get(self.signal_name)
+        if result is None:
+            return None
+        meta = result.metadata
+
+        if ctx.direction == "LONG" and self.long_field:
+            level = meta.get(self.long_field)
+            if level is not None and ctx.bar.close < float(level) - self.offset:
+                return self.exit_type
+        elif ctx.direction == "SHORT" and self.short_field:
+            level = meta.get(self.short_field)
+            if level is not None and ctx.bar.close > float(level) + self.offset:
+                return self.exit_type
+        return None
+
+
 # ── Condition registry ──────────────────────────────────────────────
 
 _CONDITION_TYPES: dict[str, type[ExitCondition]] = {
@@ -357,6 +555,11 @@ _CONDITION_TYPES: dict[str, type[ExitCondition]] = {
     "adverse_signal_exit": AdverseSignalExit,
     "regime_exit": RegimeExit,
     "volatility_expansion_exit": VolatilityExpansionExit,
+    "adverse_momentum": AdverseMomentum,
+    "signal_bound_exit": SignalBoundExit,
+    "price_vs_signal_exit": PriceVsSignalExit,
+    "bracket_target": BracketTarget,
+    "bracket_stop": BracketStop,
 }
 
 

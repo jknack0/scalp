@@ -60,18 +60,28 @@ va_bounce:
   beyond_va_exit_pts: 3.0
 
 exit:
-  # Stop via ATR multiple (target is computed dynamically in strategy)
   stop:
     type: atr_multiple
     multiplier: 2.0
   time_stop_minutes: 25
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # Price closes beyond VA boundary by > 3.0 pts against position
-    - type: beyond_va
-      threshold_pts: 3.0
-    # Adverse momentum — 2 bars moving 1.0x ATR against position
-    - type: adverse_momentum
-      bars: 2
-      atr_multiple: 1.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 5
+  # Price closes beyond VA boundary against position
+  - type: price_vs_signal_exit
+    enabled: true
+    signal: value_area
+    long_field: val
+    short_field: vah
+    offset: 3.0
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 1.0
+    max_bars: 2

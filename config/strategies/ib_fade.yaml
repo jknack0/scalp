@@ -48,18 +48,30 @@ filters:
 
 exit:
   target:
-    type: ib_mid                # target IB midpoint (computed in strategy)
+    type: ib_mid
   stop:
-    type: fixed_ticks           # 10 ticks (2.50 points) beyond IB extreme
+    type: fixed_ticks
     ticks: 10
   time_stop_minutes: 30
-  stop_ticks: 10
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # IB break: price breaks 1.0 point beyond IB range
-    - type: ib_break
-      buffer_points: 1.0
-    # ADX trending: ADX > 28 means trend developing, fade thesis fails
-    - type: adx_trending
-      threshold: 28.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 6
+  # IB break: price breaks beyond IB range
+  - type: price_vs_signal_exit
+    enabled: true
+    signal: initial_balance
+    long_field: ib_low
+    short_field: ib_high
+    offset: 1.0
+  # ADX trending: trend developing, fade thesis fails
+  - type: signal_bound_exit
+    enabled: true
+    signal: adx
+    upper_bound: 28.0

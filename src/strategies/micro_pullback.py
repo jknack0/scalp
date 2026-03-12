@@ -52,9 +52,6 @@ class MicroPullbackStrategy:
         self._exit_builder = ExitBuilder.from_yaml(exit_cfg)
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 5)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -229,71 +226,6 @@ class MicroPullbackStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string (e.g. "early:adverse_momentum") or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "adverse_momentum":
-            return self._check_adverse_momentum_exit(cond, bar, bars_in_trade, direction, fill_price)
-
-        return None
-
-    def _check_adverse_momentum_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Exit if a single bar closes > threshold points against position.
-
-        For micro-pullback: 1 bar closing > 1.0 point adverse = momentum failing.
-        """
-        threshold_points = cond.get("threshold_points", 1.0)
-
-        # Unrealized P&L using bar close as mark
-        if direction == Direction.LONG:
-            unrealized = bar.close - fill_price
-        else:
-            unrealized = fill_price - bar.close
-
-        if unrealized < -threshold_points:
-            logger.info("early_exit_adverse_momentum",
-                        direction=direction.value,
-                        bars_in_trade=bars_in_trade,
-                        unrealized=round(unrealized, 2),
-                        threshold=round(-threshold_points, 2))
-            return "early:adverse_momentum"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

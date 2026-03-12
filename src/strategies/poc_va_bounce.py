@@ -51,9 +51,6 @@ class POCVABounceStrategy:
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 25)
         self._stop_atr_mult: float = exit_cfg.get("stop", {}).get("multiplier", 2.0)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -261,116 +258,6 @@ class POCVABounceStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "beyond_va":
-            return self._check_beyond_va_exit(cond, bar, bundle, direction)
-
-        if exit_type == "adverse_momentum":
-            return self._check_adverse_momentum_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-
-        return None
-
-    def _check_beyond_va_exit(
-        self, cond: dict, bar: BarEvent, bundle: SignalBundle, direction: Direction
-    ) -> str | None:
-        """Exit if price closes beyond VA boundary by > threshold pts against position.
-
-        LONG (entered near VAL): exit if price drops below VAL by > threshold
-        SHORT (entered near VAH): exit if price rises above VAH by > threshold
-        """
-        threshold = cond.get("threshold_pts", self._beyond_va_exit_pts)
-
-        va_result = bundle.get("value_area")
-        if va_result is None:
-            return None
-
-        va_meta = va_result.metadata
-        vah = va_meta.get("vah", 0.0)
-        val = va_meta.get("val", 0.0)
-
-        if vah == 0.0 or val == 0.0:
-            return None
-
-        price = bar.close
-
-        if direction == Direction.LONG and price < val - threshold:
-            logger.info("early_exit_beyond_va", direction="LONG",
-                        price=price, val=round(val, 2), threshold=threshold)
-            return "early:beyond_va"
-        if direction == Direction.SHORT and price > vah + threshold:
-            logger.info("early_exit_beyond_va", direction="SHORT",
-                        price=price, vah=round(vah, 2), threshold=threshold)
-            return "early:beyond_va"
-        return None
-
-    def _check_adverse_momentum_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Exit if unrealized loss exceeds ATR multiple within first N bars."""
-        max_bars = cond.get("bars", 2)
-        atr_mult = cond.get("atr_multiple", 1.0)
-
-        if bars_in_trade > max_bars:
-            return None
-
-        atr_result = bundle.get("atr")
-        if atr_result is None:
-            return None
-        atr_raw = atr_result.metadata.get("atr_raw", 0.0)
-        if atr_raw <= 0:
-            return None
-
-        if direction == Direction.LONG:
-            unrealized = bar.close - fill_price
-        else:
-            unrealized = fill_price - bar.close
-
-        threshold = -atr_mult * atr_raw
-        if unrealized < threshold:
-            logger.info("early_exit_adverse_momentum",
-                        direction=direction.value,
-                        bars_in_trade=bars_in_trade,
-                        unrealized=round(unrealized, 2),
-                        threshold=round(threshold, 2))
-            return "early:adverse_momentum"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

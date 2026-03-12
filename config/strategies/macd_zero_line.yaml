@@ -56,11 +56,23 @@ exit:
     multiplier: 1.5
   time_stop_minutes: 45
 
-  # Early exit conditions -- any one triggers market exit (OR logic)
-  early_exit:
-    # MACD histogram crosses zero against position
-    - type: histogram_zero_cross
-    # Adverse momentum -- 3 bars moving 1.0x ATR against position
-    - type: adverse_momentum
-      bars: 3
-      atr_multiple: 1.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 9
+  # MACD histogram crosses zero against position
+  - type: adverse_signal_exit
+    enabled: true
+    signal: macd
+    field: histogram
+    long_threshold: 0.0
+    short_threshold: 0.0
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 1.0
+    max_bars: 3

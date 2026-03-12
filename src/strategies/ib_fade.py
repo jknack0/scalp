@@ -61,9 +61,6 @@ class IBFadeStrategy:
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 30)
         self._stop_ticks: int = exit_cfg.get("stop_ticks", STOP_TICKS)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -243,89 +240,6 @@ class IBFadeStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, direction)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        direction: Direction,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "ib_break":
-            return self._check_ib_break_exit(cond, bar, bundle, direction)
-
-        if exit_type == "adx_trending":
-            return self._check_adx_trending_exit(cond, bundle)
-
-        return None
-
-    def _check_ib_break_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        direction: Direction,
-    ) -> str | None:
-        """Exit if price breaks beyond IB range (thesis invalidated).
-
-        Shorts exit if close > IB_high + buffer.
-        Longs exit if close < IB_low - buffer.
-        """
-        buffer = cond.get("buffer_points", 1.0)
-        ib_result = bundle.get("initial_balance")
-        if ib_result is None:
-            return None
-        meta = ib_result.metadata
-        ib_high = meta.get("ib_high", 0.0)
-        ib_low = meta.get("ib_low", 0.0)
-
-        if direction == Direction.SHORT and bar.close > ib_high + buffer:
-            logger.info("early_exit_ib_break", direction="SHORT",
-                        close=bar.close, ib_high=ib_high, buffer=buffer)
-            return "early:ib_break"
-        if direction == Direction.LONG and bar.close < ib_low - buffer:
-            logger.info("early_exit_ib_break", direction="LONG",
-                        close=bar.close, ib_low=ib_low, buffer=buffer)
-            return "early:ib_break"
-        return None
-
-    def _check_adx_trending_exit(
-        self,
-        cond: dict,
-        bundle: SignalBundle,
-    ) -> str | None:
-        """Exit if ADX rises above threshold (trend developing, fade thesis fails)."""
-        threshold = cond.get("threshold", 28.0)
-        adx_result = bundle.get("adx")
-        if adx_result is None:
-            return None
-        if adx_result.value > threshold:
-            logger.info("early_exit_adx_trending",
-                        adx=round(adx_result.value, 1), threshold=threshold)
-            return "early:adx_trending"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

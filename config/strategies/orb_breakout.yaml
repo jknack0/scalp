@@ -65,12 +65,22 @@ exit:
     buffer_ticks: 2
   time_stop_minutes: 60
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # Adverse momentum — 3 bars moving 1.0x ATR against position
-    - type: adverse_momentum
-      bars: 3
-      atr_multiple: 1.0
-    # VWAP slope accelerating against position
-    - type: vwap_slope
-      threshold: 0.5
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 60
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 1.0
+    max_bars: 3
+  - type: adverse_signal_exit
+    enabled: true
+    signal: vwap_session
+    field: slope
+    long_threshold: -0.5
+    short_threshold: 0.5

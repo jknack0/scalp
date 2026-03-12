@@ -54,12 +54,22 @@ exit:
     multiplier: 1.0
   time_stop_minutes: 30
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # Price re-enters Keltner Channel within 3 bars of entry
-    - type: keltner_reentry
-      bars: 3
-    # Adverse momentum — 2 bars moving 1.0x ATR against position
-    - type: adverse_momentum
-      bars: 2
-      atr_multiple: 1.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 6
+  - type: price_vs_signal_exit
+    enabled: true
+    signal: keltner_channel
+    long_field: upper
+    short_field: lower
+    max_bars: 3
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 1.0
+    max_bars: 2

@@ -64,9 +64,6 @@ class PDHPDLFadeStrategy:
         exit_cfg = config.get("exit", {})
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 20)
 
-        # Parse early exit conditions from YAML
-        self._early_exits = exit_cfg.get("early_exit", [])
-
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -271,117 +268,6 @@ class PDHPDLFadeStrategy:
             signal_id=signal.id,
         )
         return signal
-
-    def check_early_exit(
-        self,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Check if any early exit condition fires (OR logic).
-
-        Called by the backtest engine on each bar while a position is open.
-        Returns an exit reason string or None.
-        """
-        for cond in self._early_exits:
-            reason = self._eval_early_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-            if reason is not None:
-                return reason
-        return None
-
-    def _eval_early_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Evaluate a single early exit condition."""
-        exit_type = cond.get("type", "")
-
-        if exit_type == "level_breach":
-            return self._check_level_breach_exit(cond, bar, bundle, direction)
-
-        if exit_type == "adverse_momentum":
-            return self._check_adverse_momentum_exit(cond, bar, bundle, bars_in_trade, direction, fill_price)
-
-        return None
-
-    def _check_level_breach_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        direction: Direction,
-    ) -> str | None:
-        """Exit if price closes beyond PDH (shorts) or below PDL (longs).
-
-        Indicates the level failed to hold and the fade thesis is invalidated.
-        """
-        breach_points = cond.get("breach_points", 1.5)
-        pdl_result = bundle.get("prior_day_levels")
-        if pdl_result is None:
-            return None
-        meta = pdl_result.metadata
-        pdh = meta.get("pdh", 0.0)
-        pdl = meta.get("pdl", 0.0)
-
-        if pdh == 0.0 or pdl == 0.0:
-            return None
-
-        if direction == Direction.SHORT and bar.close > pdh + breach_points:
-            logger.info("early_exit_level_breach", direction="SHORT",
-                        close=bar.close, pdh=pdh,
-                        breach=round(bar.close - pdh, 2))
-            return "early:level_breach"
-        if direction == Direction.LONG and bar.close < pdl - breach_points:
-            logger.info("early_exit_level_breach", direction="LONG",
-                        close=bar.close, pdl=pdl,
-                        breach=round(pdl - bar.close, 2))
-            return "early:level_breach"
-        return None
-
-    def _check_adverse_momentum_exit(
-        self,
-        cond: dict,
-        bar: BarEvent,
-        bundle: SignalBundle,
-        bars_in_trade: int,
-        direction: Direction,
-        fill_price: float,
-    ) -> str | None:
-        """Exit if unrealized loss exceeds ATR multiple within first N bars."""
-        max_bars = cond.get("bars", 2)
-        atr_mult = cond.get("atr_multiple", 0.75)
-
-        if bars_in_trade > max_bars:
-            return None
-
-        atr_result = bundle.get("atr")
-        if atr_result is None:
-            return None
-        atr_raw = atr_result.metadata.get("atr_raw", 0.0)
-        if atr_raw <= 0:
-            return None
-
-        if direction == Direction.LONG:
-            unrealized = bar.close - fill_price
-        else:
-            unrealized = fill_price - bar.close
-
-        threshold = -atr_mult * atr_raw
-        if unrealized < threshold:
-            logger.info("early_exit_adverse_momentum",
-                        direction=direction.value,
-                        bars_in_trade=bars_in_trade,
-                        unrealized=round(unrealized, 2),
-                        threshold=round(threshold, 2))
-            return "early:adverse_momentum"
-        return None
 
     def reset(self) -> None:
         self._signals_today = 0

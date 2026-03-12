@@ -43,12 +43,23 @@ filters:
 exit:
   time_stop_minutes: 20
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # Price closes beyond PDH by 1.5 (shorts) or below PDL by 1.5 (longs)
-    - type: level_breach
-      breach_points: 1.5
-    # Adverse momentum — 2 bars moving 0.75x ATR against position
-    - type: adverse_momentum
-      bars: 2
-      atr_multiple: 0.75
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 4
+  # Price closes beyond PDH (shorts) or below PDL (longs) by 1.5 pts
+  - type: price_vs_signal_exit
+    enabled: true
+    signal: prior_day_levels
+    long_field: pdl
+    short_field: pdh
+    offset: 1.5
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 0.75
+    max_bars: 2

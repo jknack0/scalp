@@ -44,8 +44,15 @@ exit:
     ticks: 6               # 1.5 points
   time_stop_minutes: 5
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # Adverse momentum — 1 bar closing > 1.0 point against position
-    - type: adverse_momentum
-      threshold_points: 1.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 5
+  - type: adverse_momentum
+    enabled: true
+    threshold_points: 1.0

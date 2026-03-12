@@ -50,13 +50,22 @@ exit:
     multiplier: 1.5
   time_stop_minutes: 15
 
-  # Early exit conditions — any one triggers market exit (OR logic)
-  early_exit:
-    # MFI reverses without price following
-    - type: mfi_reversal
-      long_exit_mfi: 40.0
-      short_exit_mfi: 60.0
-    # Adverse momentum — 2 bars moving 1.0x ATR against position
-    - type: adverse_momentum
-      bars: 2
-      atr_multiple: 1.0
+# Declarative exits — evaluated by ExitEngine each bar (OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 3
+  # MFI reversal: LONG exit when MFI > 40 (recovered from oversold),
+  # SHORT exit when MFI < 60 (recovered from overbought).
+  # adverse_signal_exit with flipped thresholds: LONG exits on value < threshold
+  # doesn't apply here (we want exit on value > threshold for LONG).
+  # Approximated: bracket_stop handles the stop, time_stop limits exposure.
+  # TODO: add direction-aware signal_recovery_exit type for exact MFI reversal
+  - type: adverse_momentum
+    enabled: true
+    atr_multiple: 1.0
+    max_bars: 2
