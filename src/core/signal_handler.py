@@ -99,14 +99,16 @@ class SignalHandler:
             from src.core.bar_resampler import _freq_to_seconds
 
             freq_seconds = _freq_to_seconds(bar_freq)
-            # How many 1m bars do we need to get `bars` target-freq bars?
-            bars_1m_needed = bars * max(freq_seconds // 60, 1)
+            # How many 1m source bars to get `bars` target-freq RTH-only bars?
+            # RTH = 6.5h/day = 390 min. Target bars in 1m: bars * (freq/60).
+            # Add 2× calendar days to account for overnight + weekends.
+            rth_minutes_needed = bars * max(freq_seconds // 60, 1)
+            calendar_days = max(rth_minutes_needed / 390 * 2, 3)
 
             client = db.Historical(key=api_key)
 
-            # Request extra time window to account for overnight gaps
             end = datetime.now(timezone.utc) - timedelta(minutes=30)
-            start = end - timedelta(minutes=bars_1m_needed * 3)
+            start = end - timedelta(days=calendar_days)
 
             # Continuous front-month (e.g. MES.c.0)
             root = symbol[:3] if len(symbol) > 3 else symbol

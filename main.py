@@ -181,7 +181,7 @@ async def main() -> None:
         handler.warmup_from_databento(
             symbol=config.symbol,
             api_key=config.databento_api_key,
-            bars=600,
+            bars=400,
             bar_freq=bar_freq,
         )
 
