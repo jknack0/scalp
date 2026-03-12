@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Joint entry + exit sweep for VWAP Band Reversion over 10yr.
+"""Joint entry + exit sweep for VWAP Band Reversion.
 
 Sweeps BOTH entry filter thresholds and exit params simultaneously.
 Signals are pre-computed once; only filter thresholds + exit configs vary per combo.
@@ -8,8 +8,9 @@ Entry params swept: deviation_sd, slope, adx, relative_volume
 Exit params swept: stop_atr, target_sd, time_bars, trailing_stop (on/off)
 
 Usage:
-  python scripts/tune/vwap_band_joint.py                         # default (YAML model)
-  python scripts/tune/vwap_band_joint.py --hmm models/hmm/v5_2state_full  # override HMM
+  python scripts/tune/vwap_band_joint.py                         # default (regime_v2)
+  python scripts/tune/vwap_band_joint.py --hmm models/hmm/v5_2state_full  # legacy HMM
+  python scripts/tune/vwap_band_joint.py --years 5               # 5yr window (default: 10)
 """
 import argparse
 import os, sys, time as _time, logging, math
@@ -78,7 +79,7 @@ def build_filters(dev_sd, slope, adx, rvol):
         {"signal": "vwap_session", "field": "deviation_sd", "expr": f"abs >= {dev_sd}"},
         {"signal": "adx", "expr": f"< {adx}"},
         {"signal": "relative_volume", "expr": f">= {rvol}"},
-        {"signal": "hmm_regime", "expr": "passes"},
+        {"signal": "regime_v2", "expr": "passes"},
     ]
 
 
@@ -97,8 +98,8 @@ def build_exits(stop_atr, target_sd, time_bars, trail_atr, trail_act):
          "atr_multiple": trail_atr if trail_atr > 0 else 1.0,
          "activate_after_ticks": trail_act if trail_act > 0 else 99},
         {"type": "regime_exit", "enabled": True,
-         "hmm_signal": "hmm_regime",
-         "hostile_regimes_long": [1], "hostile_regimes_short": [1],
+         "hmm_signal": "regime_v2",
+         "hostile_regimes_long": [0, 2], "hostile_regimes_short": [0, 2],
          "min_bars_before_active": 2},
     ]
 
@@ -190,27 +191,31 @@ def fast_run(bars, bundles, dates, times, et_times,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hmm", type=str, default=None,
-                        help="Override HMM model path (default: use YAML config)")
+                        help="Use legacy HMM model instead of regime_v2")
+    parser.add_argument("--regime-v2", type=str, default="models/regime_v2",
+                        help="Regime V2 model path (default: models/regime_v2)")
+    parser.add_argument("--years", type=int, default=10,
+                        help="Backtest window in years (default: 10)")
     args = parser.parse_args()
 
     yaml_path = "config/strategies/vwap_band_reversion.yaml"
     with open(yaml_path) as f:
         base_cfg = yaml.safe_load(f)
 
-    signal_names = [s for s in base_cfg.get("signals", []) if s != "hmm_regime"]
+    # Exclude regime signals from pre-compute (injected separately in batch)
+    signal_names = [s for s in base_cfg.get("signals", [])
+                    if s not in ("hmm_regime", "regime_v2")]
     signal_configs = base_cfg.get("signal_configs", {})
-
-    # Override HMM model path if specified
-    if args.hmm:
-        signal_configs.setdefault("hmm_regime", {})["model_path"] = args.hmm
-        p(f"HMM model override: {args.hmm}")
 
     signal_engine = SignalEngine(signal_names, signal_configs)
 
+    end_date = date(2025, 2, 28)
+    start_date = date(end_date.year - args.years, end_date.month, end_date.day)
+
     config = BacktestConfig(
         strategies=[],
-        start_date=date(2015, 3, 1),
-        end_date=date(2025, 2, 28),
+        start_date=start_date,
+        end_date=end_date,
         parquet_dir="data/parquet_5m",
         resample_freq="5m",
         signal_engine=signal_engine,
@@ -218,21 +223,15 @@ def main():
 
     engine = BacktestEngine()
 
-    # ── Pre-compute bundles (fast signals only, no HMM) ──
-    p("Pre-computing signal bundles for 10 years...")
+    # ── Pre-compute bundles (fast signals only, no regime) ──
+    p(f"Pre-computing signal bundles for {args.years} years ({start_date} to {end_date})...")
     t0 = _time.time()
     bundles = engine.precompute_bundles(config)
     p(f"  {len(bundles)} bundles in {_time.time() - t0:.1f}s")
 
-    # ── Pre-compute HMM regime states ──
-    from src.models.hmm_regime import HMMRegimeClassifier, RegimeState, build_feature_matrix
     from src.signals.base import SignalResult
 
-    hmm_cfg = signal_configs.get("hmm_regime", {})
-    pass_states_str = hmm_cfg.get("pass_states", [])
-    pass_states = [RegimeState[s] for s in pass_states_str]
-
-    p("Pre-building BarEvent array + HMM features...")
+    p("Pre-building BarEvent array + regime features...")
     t1 = _time.time()
     bars_df = engine._load_bars(config)
     bars_df = bars_df.with_columns(
@@ -251,9 +250,16 @@ def main():
         pl.col("_et_ts").dt.time().alias("_bar_time"),
     )
 
-    if hmm_cfg.get("model_path"):
-        p("  Loading HMM model and predicting regime states...")
-        clf = HMMRegimeClassifier.load(hmm_cfg["model_path"])
+    if args.hmm:
+        # ── Legacy HMM path ──
+        from src.models.hmm_regime import HMMRegimeClassifier, RegimeState, build_feature_matrix
+        hmm_cfg = signal_configs.get("hmm_regime", {})
+        hmm_cfg["model_path"] = args.hmm
+        pass_states_str = hmm_cfg.get("pass_states", ["RANGE_BOUND"])
+        pass_states = [RegimeState[s] for s in pass_states_str]
+
+        p(f"  Loading legacy HMM from {args.hmm}...")
+        clf = HMMRegimeClassifier.load(args.hmm)
         features, timestamps = build_feature_matrix(bars_df)
         states = clf.predict_sequence(features)
         p(f"  HMM: {features.shape} features, {len(states)} states")
@@ -278,11 +284,78 @@ def main():
                     },
                 )
                 merged = dict(bundles[i].results)
-                merged["hmm_regime"] = hmm_result
+                merged["regime_v2"] = hmm_result
                 bundles[i] = SignalBundle(results=merged, bar_count=bundles[i].bar_count)
                 hmm_injected += 1
 
-        p(f"  Injected HMM into {hmm_injected}/{len(bundles)} bundles")
+        p(f"  Injected legacy HMM into {hmm_injected}/{len(bundles)} bundles")
+    else:
+        # ── Regime Detector V2 path ──
+        from src.models.regime_detector_v2 import (
+            RegimeDetectorV2, RegimeLabel, build_features_v2,
+        )
+
+        regime_cfg = signal_configs.get("regime_v2", {})
+        model_path = args.regime_v2
+        pass_labels_str = regime_cfg.get("pass_states", ["RANGING"])
+        pass_labels = [RegimeLabel[s] for s in pass_labels_str]
+
+        p(f"  Loading RegimeDetectorV2 from {model_path}...")
+        detector = RegimeDetectorV2.load(model_path)
+        features, timestamps = build_features_v2(bars_df, detector.config)
+        probas = detector.predict_proba_sequence(features)
+        p(f"  Regime V2: {features.shape} features, {len(probas)} predictions")
+
+        # Map timestamps to probas
+        bar_ts = bars_df["timestamp"].dt.epoch("ns").to_numpy()
+        ts_to_idx = {int(ts): idx for idx, ts in enumerate(timestamps.tolist())}
+        regime_injected = 0
+
+        for i in range(len(bundles)):
+            bar_ns = int(bar_ts[i])
+            proba_idx = ts_to_idx.get(bar_ns)
+            if proba_idx is not None:
+                proba = probas[proba_idx]
+                passes = proba.regime in pass_labels
+                if proba.whipsaw_halt:
+                    passes = False
+                if proba.position_size == "flat":
+                    passes = False
+
+                prob_dict = {
+                    label.name: float(proba.probabilities[label.value])
+                    for label in RegimeLabel
+                }
+                regime_result = SignalResult(
+                    value=float(proba.regime.value),
+                    passes=passes,
+                    direction="none",
+                    metadata={
+                        "regime": proba.regime.name,
+                        "regime_value": proba.regime.value,
+                        "probabilities": prob_dict,
+                        "confidence": proba.confidence,
+                        "position_size": proba.position_size,
+                        "transition_signal": proba.transition_signal,
+                        "bars_in_regime": proba.bars_in_regime,
+                        "whipsaw_halt": proba.whipsaw_halt,
+                        "pass_states": [l.name for l in pass_labels],
+                    },
+                )
+                merged = dict(bundles[i].results)
+                merged["regime_v2"] = regime_result
+                bundles[i] = SignalBundle(results=merged, bar_count=bundles[i].bar_count)
+                regime_injected += 1
+
+        p(f"  Injected regime_v2 into {regime_injected}/{len(bundles)} bundles")
+
+        # Show regime distribution
+        from collections import Counter as _Counter
+        dist = _Counter()
+        for proba in probas:
+            dist[proba.regime.name] += 1
+        total_p = sum(dist.values())
+        p(f"  Regime distribution: {dict({k: f'{v/total_p:.1%}' for k, v in dist.items()})}")
 
     # Build BarEvent array once
     bar_events = []
@@ -311,7 +384,7 @@ def main():
     entry_combos = list(product(GRID_DEV_SD, GRID_SLOPE, GRID_ADX, GRID_RVOL))
     exit_combos = list(product(GRID_STOP_ATR, GRID_TGT_SD, GRID_TIME, GRID_TRAIL))
     total = len(entry_combos) * len(exit_combos)
-    p(f"\nJoint sweep: {len(entry_combos)} entry x {len(exit_combos)} exit = {total} combos over 10yr")
+    p(f"\nJoint sweep: {len(entry_combos)} entry x {len(exit_combos)} exit = {total} combos over {args.years}yr")
 
     # ── Run sweep ──
     t0 = _time.time()

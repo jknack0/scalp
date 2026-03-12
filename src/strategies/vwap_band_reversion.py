@@ -26,6 +26,7 @@ from src.exits.exit_builder import ExitBuilder, ExitContext
 from src.exits.exit_engine import ExitEngine
 from src.filters.filter_engine import FilterEngine
 from src.models.hmm_regime import RegimeState
+from src.models.regime_detector_v2 import RegimeLabel
 from src.signals.signal_bundle import EMPTY_BUNDLE, SignalBundle
 from src.strategies.base import Direction, Signal
 
@@ -56,6 +57,13 @@ class VWAPBandReversionStrategy:
 
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
+
+        # Map RegimeLabel -> RegimeState for Signal.regime_state field
+        self._label_to_state = {
+            RegimeLabel.RANGING: RegimeState.RANGE_BOUND,
+            RegimeLabel.TRENDING: RegimeState.TRENDING,
+            RegimeLabel.HIGH_VOL: RegimeState.VOLATILE,
+        }
 
         # State
         self._signals_today = 0
@@ -103,18 +111,31 @@ class VWAPBandReversionStrategy:
         # Direction from VWAP deviation
         direction = Direction.LONG if deviation_sd < 0 else Direction.SHORT
 
+        # Update regime state from V2 signal
+        regime_result = bundle.get("regime_v2")
+        if regime_result is not None and regime_result.metadata.get("regime_value") is not None:
+            label = RegimeLabel(regime_result.metadata["regime_value"])
+            self._current_regime = self._label_to_state.get(label, RegimeState.RANGE_BOUND)
+
         # Log that filters passed — show key signal values
         adx_result = bundle.get("adx")
         rvol_result = bundle.get("relative_volume")
         adx_val = adx_result.value if adx_result else 0.0
         rvol_val = rvol_result.value if rvol_result else 0.0
 
+        # Regime metadata for logging
+        regime_name = regime_result.metadata.get("regime", "unknown") if regime_result else "unknown"
+        regime_conf = regime_result.metadata.get("confidence", 0.0) if regime_result else 0.0
+        regime_size = regime_result.metadata.get("position_size", "unknown") if regime_result else "unknown"
+
         logger.info("filters_passed", time=now.strftime("%H:%M"),
                     close=bar.close, direction=direction.value,
                     deviation_sd=round(deviation_sd, 2),
                     vwap=round(vwap, 2), sd=round(sd, 2),
                     slope=round(slope, 4), session_age=session_age,
-                    adx=round(adx_val, 1), rvol=round(rvol_val, 1))
+                    adx=round(adx_val, 1), rvol=round(rvol_val, 1),
+                    regime=regime_name, regime_conf=round(regime_conf, 3),
+                    regime_size=regime_size)
 
         # Entry at current price
         entry_price = bar.close
@@ -168,6 +189,9 @@ class VWAPBandReversionStrategy:
                 "atr": atr_raw,
                 "adx": adx_val,
                 "rvol": rvol_val,
+                "regime": regime_name,
+                "regime_confidence": regime_conf,
+                "regime_position_size": regime_size,
             },
         )
 

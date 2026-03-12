@@ -1,12 +1,12 @@
 # Strategy 1: VWAP Band Reversion with regime gating
-# Mean reversion to VWAP when price deviates >=3.0 SD during range-bound sessions.
+# Mean reversion to VWAP when price deviates >=2.5 SD during range-bound sessions.
 # All entry gates are declarative filters evaluated by FilterEngine.
 #
-# Tuned 2026-03-11 joint entry+exit sweep (Mar 2015 - Feb 2025, 10yr):
-#   64 trades, 70.3% WR, Sharpe 3.27, PF 2.04, $669 net, DD 1.79%
-#   Exit mix: 72% TP, 12% hard stop, 8% early, 8% session
-#   Key changes from v1: ADX <25→<20, stop 3→4x ATR, target 0.5→1.0 SD,
-#   time 30→45 bars, trailing stop disabled (no effect over 10yr)
+# Tuned 2026-03-12 joint entry+exit sweep with regime_v2 (Feb 2020 - Feb 2025, 5yr):
+#   55 trades, 70.9% WR, Sharpe 2.96, PF 1.80, $667 net, DD 2.89%
+#   Exit mix: 62% TP, 16% hard stop, 13% regime_flip, 5% session, 4% slope
+#   Key changes from v2: regime_v2 (3-state HMM), ADX <20→<18, dev 3.0→2.5 SD,
+#   stop 4→3x ATR, time 45→30 bars
 
 strategy:
   strategy_id: vwap_band_reversion
@@ -20,14 +20,14 @@ bar:
   enrich: false
 
 # Signal pipeline: pre-computed per bar window
-signals: [vwap_session, adx, atr, relative_volume, session_time, hmm_regime]
+signals: [vwap_session, adx, atr, relative_volume, session_time, regime_v2]
 signal_configs:
   adx:
     period: 14
     threshold: 25.0
-  hmm_regime:
-    model_path: models/hmm/v4_2state
-    pass_states: [RANGE_BOUND]
+  regime_v2:
+    model_path: models/regime_v2
+    pass_states: [RANGING]
 
 # All entry gates are declarative filters
 filters:
@@ -44,36 +44,36 @@ filters:
   - signal: vwap_session
     field: slope
     expr: "abs <= 0.5"
-  # Price must be >= 3.0 SD from VWAP
+  # Price must be >= 2.5 SD from VWAP (loosened from 3.0 — regime gate handles selectivity)
   - signal: vwap_session
     field: deviation_sd
-    expr: "abs >= 3.0"
-  # ADX must be below 20 (truly range-bound — tightened from <25)
+    expr: "abs >= 2.5"
+  # ADX must be below 18 (tightened from <20 — regime_v2 + ADX double-gate)
   - signal: adx
-    expr: "< 20.0"
+    expr: "< 18.0"
   # Volume must be >= 0.3x average
   - signal: relative_volume
     expr: ">= 0.3"
-  # HMM regime: only trade in range-bound
-  - signal: hmm_regime
+  # Regime V2: only trade in range-bound (also blocks on whipsaw halt + flat sizing)
+  - signal: regime_v2
     expr: passes
 
 # Declarative exits — evaluated by ExitEngine each bar (OR logic)
 exits:
-  # Hard stop: 4.0 x ATR from fill price (widened from 3.0)
+  # Hard stop: 3.0 x ATR from fill price (tightened from 4.0 — regime exit catches adverse moves)
   - type: static_stop
     enabled: true
-    atr_multiple: 4.0
+    atr_multiple: 3.0
   # Take profit: price reverts to within 1.0 SD of VWAP (widened from 0.5)
   - type: vwap_reversion_target
     enabled: true
     target_sd_band: 1.0
     vwap_signal: vwap_session
     deviation_field: deviation_sd
-  # Time stop: exit after 45 bars (= 225 min on 5m bars, extended from 30)
+  # Time stop: exit after 30 bars (= 150 min on 5m bars, tightened from 45)
   - type: time_stop
     enabled: true
-    max_bars: 45
+    max_bars: 30
   # VWAP slope going adverse = trend developing against us
   - type: adverse_signal_exit
     enabled: true
@@ -81,12 +81,12 @@ exits:
     field: slope
     long_threshold: -0.5
     short_threshold: 0.5
-  # Regime flips to volatile while in a mean-reversion trade
+  # Regime flips to trending or high-vol while in a mean-reversion trade
   - type: regime_exit
     enabled: true
-    hmm_signal: hmm_regime
-    hostile_regimes_long: [1]
-    hostile_regimes_short: [1]
+    hmm_signal: regime_v2
+    hostile_regimes_long: [0, 2]
+    hostile_regimes_short: [0, 2]
     min_bars_before_active: 2
 
 # Legacy exit config — kept for backward compat with ExitBuilder
@@ -95,5 +95,5 @@ exit:
     type: vwap
   stop:
     type: atr_multiple
-    multiplier: 4.0
-  time_stop_minutes: 225
+    multiplier: 3.0
+  time_stop_minutes: 150

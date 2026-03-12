@@ -14,6 +14,7 @@ from src.signals.atr import ATRConfig, ATRSignal
 from src.signals.cvd_divergence import CVDDivergenceConfig, CVDDivergenceSignal
 from src.signals.ema_crossover import EMACrossoverConfig, EMACrossoverSignal
 from src.signals.hmm_regime import HMMRegimeConfig, HMMRegimeSignal
+from src.signals.regime_v2 import RegimeV2Config, RegimeV2Signal
 from src.signals.orb_breakout import ORBBreakoutConfig, ORBBreakoutSignal
 from src.signals.orb_range_size import ORBRangeSizeConfig, ORBRangeSizeSignal
 from src.signals.poc_distance import POCDistanceConfig, POCDistanceSignal
@@ -106,4 +107,6 @@ __all__ = [
     "MACDSignal",
     "ValueAreaConfig",
     "ValueAreaSignal",
+    "RegimeV2Config",
+    "RegimeV2Signal",
 ]
