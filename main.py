@@ -160,6 +160,10 @@ async def main() -> None:
     )
     handler.wire()
 
+    # Warm up signals from historical bars in Postgres
+    if os.environ.get("DATABASE_URL"):
+        handler.warmup_from_postgres(symbol=config.symbol, bars=500)
+
     # ── Tick aggregator (ticks → bars) ───────────────────────
     aggregator = TickAggregator(
         bus,

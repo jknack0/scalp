@@ -68,6 +68,64 @@ class SignalHandler:
             paper=self._oms.is_paper,
         )
 
+    def warmup_from_postgres(self, symbol: str, bars: int = 500) -> None:
+        """Pre-feed historical bars from Postgres to warm up signals.
+
+        Reads the last N 1m bars from bars_1m, converts to BarEvents,
+        and runs the signal engine on them so regime detector, ADX, ATR,
+        VWAP, etc. all have context on first live bar.
+        """
+        import os
+        dsn = os.environ.get("DATABASE_URL", "")
+        if not dsn:
+            return
+        if self._signal_engine is None:
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(dsn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT timestamp, open, high, low, close, volume "
+                    "FROM bars_1m WHERE symbol = %s "
+                    "ORDER BY timestamp DESC LIMIT %s",
+                    (symbol, bars),
+                )
+                rows = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            logger.warning("warmup_db_error", error=str(e))
+            return
+
+        if not rows:
+            logger.info("warmup_no_data", symbol=symbol)
+            return
+
+        # Rows are DESC, reverse to chronological
+        rows.reverse()
+
+        # Convert to BarEvents and feed to signal engine
+        for ts, o, h, l, c, vol in rows:
+            bar = BarEvent(
+                symbol=symbol,
+                open=o, high=h, low=l, close=c,
+                volume=vol,
+                bar_type="1m",
+                timestamp_ns=int(ts.timestamp() * 1e9),
+            )
+            self._bar_window.append(bar)
+
+        # Trim to max window
+        if len(self._bar_window) > 500:
+            self._bar_window = self._bar_window[-500:]
+
+        # Run signal engine once on the full window to warm up all signals
+        self._signal_engine.compute(self._bar_window)
+
+        logger.info("warmup_complete", bars_loaded=len(rows),
+                     window_size=len(self._bar_window))
+
     async def on_tick(self, tick: TickEvent) -> None:
         """Forward ticks to OMS for paper bracket monitoring."""
         await self._oms.on_tick(tick)
