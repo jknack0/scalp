@@ -94,7 +94,7 @@ Type=simple
 User=botuser
 Group=botuser
 WorkingDirectory=$BOT_DIR
-ExecStart=$UV_PATH run python main.py
+ExecStart=$UV_PATH run python main.py --strategy vwap_band
 Restart=on-failure
 RestartSec=10
 StartLimitIntervalSec=300
@@ -129,12 +129,13 @@ step "Running smoke test"
 cd "$BOT_DIR"
 $UV_PATH run python -c "
 from src.core.config import BotConfig
-from src.strategies.orb import ORBStrategy
-from src.strategies.vwap_reversion import VWAPReversionStrategy
+from src.strategies.vwap_band_reversion import VWAPBandReversionStrategy
 from src.filters.filter_engine import FilterEngine
+from src.signals.regime_v2 import RegimeV2Signal
+s = VWAPBandReversionStrategy.from_yaml('config/strategies/vwap_band_reversion.yaml')
 print('  Config loads: OK')
-print('  ORB strategy: OK')
-print('  VWAP strategy: OK')
+print('  VWAP Band strategy: OK')
+print('  RegimeV2 signal: OK')
 print('  FilterEngine: OK')
 "
 
@@ -145,10 +146,10 @@ echo "  ┌───────────────────────
 echo "  │      MES Bot — Deployment Summary           │"
 echo "  ├─────────────────────────────────────────────┤"
 echo "  │ Mode:       PAPER TRADING (demo API)        │"
-echo "  │ Strategies: ORB + VWAP                      │"
-echo "  │ Filters:    Spread z=2.0 (ORB only)         │"
-echo "  │ Symbol:     MESH6                           │"
-echo "  │ Bar size:   5s                              │"
+echo "  │ Strategies: VWAP Band (regime_v2 gated)      │"
+echo "  │ Filters:    ADX<18, dev>=2.5 SD, RANGING    │"
+echo "  │ Symbol:     MESM6                           │"
+echo "  │ Bar size:   5m                              │"
 echo "  └─────────────────────────────────────────────┘"
 echo ""
 echo "  Commands:"
