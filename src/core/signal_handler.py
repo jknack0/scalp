@@ -135,12 +135,13 @@ class SignalHandler:
                 logger.info("warmup_no_data", symbol=symbol)
                 return
 
-            # Filter to RTH only (14:30-21:00 UTC = 9:30 AM-4:00 PM ET)
-            # Prevents session-gap artifacts from inflating ATR/true range
-            df = df[
-                (df.index.hour * 60 + df.index.minute >= 14 * 60 + 30)
-                & (df.index.hour * 60 + df.index.minute < 21 * 60)
-            ]
+            # Filter to RTH only (9:30 AM - 4:00 PM ET)
+            # Use US/Eastern timezone to handle EST/EDT automatically
+            from zoneinfo import ZoneInfo
+            et = ZoneInfo("America/New_York")
+            et_index = df.index.tz_convert(et)
+            et_minutes = et_index.hour * 60 + et_index.minute
+            df = df[(et_minutes >= 9 * 60 + 30) & (et_minutes < 16 * 60)]
             if df.empty:
                 logger.info("warmup_no_rth_data", symbol=symbol)
                 return
