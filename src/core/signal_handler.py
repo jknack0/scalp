@@ -200,7 +200,7 @@ class SignalHandler:
             filter_result = self._filter_engine.evaluate(bundle)
 
             # Log signal + filter snapshot every 60 bars (~1 min)
-            if self._bar_count % 60 == 0:
+            if self._bar_count % 6 == 0:
                 self._log_snapshot(bar, bundle, filter_result)
 
             if not filter_result.passes:
