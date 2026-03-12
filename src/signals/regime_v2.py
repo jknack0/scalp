@@ -103,8 +103,14 @@ class RegimeV2Signal(SignalBase):
                 metadata={"reason": "no_bars"},
             )
 
-        # Feed only new bars (incremental)
-        new_bars = bars[self._bars_fed:]
+        # Feed only new bars (incremental).
+        # The bar window is a sliding window capped at 500 — old bars get
+        # trimmed from the front, so _bars_fed can exceed len(bars).
+        # When that happens, only the last bar (just appended) is new.
+        if self._bars_fed >= len(bars):
+            new_bars = bars[-1:]
+        else:
+            new_bars = bars[self._bars_fed:]
         proba = None
         for bar in new_bars:
             proba = self._detector.update(_bar_to_dict(bar))
