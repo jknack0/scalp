@@ -21,6 +21,7 @@ import aiohttp
 from src.core.config import BotConfig
 from src.core.events import EventBus, EventType, FillEvent, TickEvent
 from src.core.logging import get_logger
+from src.data.trade_store import TradeStore
 from src.feeds.tradovate import TradovateAuth
 from src.oms.base import BaseOMS
 from src.strategies.base import Direction, Signal
@@ -98,6 +99,9 @@ class TradovateOMS(BaseOMS):
         self._orders: dict[str, ManagedOrder] = {}
         self._position: int = 0  # net position (signed)
         self._next_id: int = 0
+
+        # Trade persistence (set externally via set_trade_store)
+        self._trade_store: TradeStore | None = None
 
     @property
     def is_paper(self) -> bool:
@@ -318,6 +322,27 @@ class TradovateOMS(BaseOMS):
                         pnl_ticks=pnl / TICK_SIZE,
                         pnl_usd=round(pnl_usd, 2),
                     )
+
+                    # Record exit to Postgres
+                    if self._trade_store:
+                        from datetime import datetime, timezone
+                        exit_dt = datetime.fromtimestamp(
+                            tick.timestamp_ns / 1e9, tz=timezone.utc,
+                        )
+                        entry_dt = datetime.fromtimestamp(
+                            order.created_at, tz=timezone.utc,
+                        )
+                        duration = (exit_dt - entry_dt).total_seconds()
+                        self._trade_store.record_exit(
+                            order_id=oid,
+                            exit_price=exit_price,
+                            exit_time=exit_dt,
+                            exit_reason=exit_reason,
+                            pnl_ticks=pnl / TICK_SIZE,
+                            pnl_usd=round(pnl_usd - COMMISSION_PER_SIDE * 2, 2),
+                            commission=COMMISSION_PER_SIDE * 2,
+                            duration_seconds=duration,
+                        )
 
                     exit_dir = "SELL" if order.direction == "Buy" else "BUY"
                     fill = FillEvent(

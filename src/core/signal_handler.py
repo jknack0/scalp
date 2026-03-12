@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from src.core.events import BarEvent, EventBus, EventType, FillEvent, TickEvent
 from src.core.logging import get_logger
+from src.data.trade_store import TradeStore
 from src.risk.risk_manager import RiskManager
 from src.signals.signal_bundle import EMPTY_BUNDLE, SignalBundle, SignalEngine
 from src.filters.filter_engine import FilterEngine
@@ -44,6 +45,7 @@ class SignalHandler:
         oms: TradovateOMS,
         signal_engine: SignalEngine | None = None,
         filter_engine: FilterEngine | None = None,
+        trade_store: TradeStore | None = None,
     ) -> None:
         self._bus = event_bus
         self._strategies = strategies
@@ -51,6 +53,7 @@ class SignalHandler:
         self._oms = oms
         self._signal_engine = signal_engine
         self._filter_engine = filter_engine or FilterEngine()
+        self._trade_store = trade_store
         self._bar_window: list[BarEvent] = []
 
     def wire(self) -> None:
@@ -145,6 +148,23 @@ class SignalHandler:
             order_id=order_id,
             rr=round(signal.risk_reward_ratio, 2),
         )
+
+        # Record trade entry to Postgres
+        if self._trade_store:
+            self._trade_store.record_entry(
+                order_id=order_id,
+                strategy_id=signal.strategy_id,
+                symbol=self._oms._config.symbol,
+                direction=direction,
+                entry_price=signal.entry_price,
+                entry_time=signal.signal_time,
+                target_price=signal.target_price,
+                stop_price=signal.stop_price,
+                confidence=signal.confidence,
+                risk_reward=signal.risk_reward_ratio,
+                regime=signal.regime_state.name if signal.regime_state else "UNKNOWN",
+                metadata=signal.metadata,
+            )
 
     async def session_close(self) -> None:
         """End-of-session cleanup: flatten position, reset strategies."""

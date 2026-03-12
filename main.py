@@ -26,6 +26,7 @@ from src.monitoring.health import HealthMonitor
 from src.oms.fill_monitor import FillMonitor
 from src.oms.tradovate_oms import TradovateOMS
 from src.data.bar_store import BarStore
+from src.data.trade_store import TradeStore
 from src.risk.risk_manager import RiskManager
 
 
@@ -142,11 +143,20 @@ async def main() -> None:
     signal_engine = build_signal_engine(yaml_cfg)
     filter_engine = build_filter_engine(yaml_cfg)
 
+    # ── Trade store (persist trades to Postgres) ─────────────
+    import os
+    trade_store: TradeStore | None = None
+    if os.environ.get("DATABASE_URL"):
+        trade_store = TradeStore()
+        oms._trade_store = trade_store
+        logger.info("trade_store_enabled")
+
     # ── Signal handler (strategies -> risk -> OMS) ────────────
     handler = SignalHandler(
         bus, strategies, risk, oms,
         signal_engine=signal_engine,
         filter_engine=filter_engine,
+        trade_store=trade_store,
     )
     handler.wire()
 
@@ -161,7 +171,6 @@ async def main() -> None:
 
     # ── Bar store (persist 1m bars to Postgres) ──────────────
     bar_store: BarStore | None = None
-    import os
     if os.environ.get("DATABASE_URL"):
         bar_store = BarStore(event_bus=bus)
         bus.subscribe(EventType.BAR, bar_store.on_bar)
@@ -232,6 +241,8 @@ async def main() -> None:
     logger.info("bot_shutting_down")
     if bar_store:
         bar_store.close()
+    if trade_store:
+        trade_store.close()
     await oms.close()
 
     for task in tasks:
