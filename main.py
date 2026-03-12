@@ -25,6 +25,7 @@ from src.feeds.tradovate import TradovateFeed
 from src.monitoring.health import HealthMonitor
 from src.oms.fill_monitor import FillMonitor
 from src.oms.tradovate_oms import TradovateOMS
+from src.data.bar_store import BarStore
 from src.risk.risk_manager import RiskManager
 
 
@@ -158,6 +159,14 @@ async def main() -> None:
     from src.core.events import EventType
     bus.subscribe(EventType.TICK, aggregator.on_tick)
 
+    # ── Bar store (persist 1m bars to Postgres) ──────────────
+    bar_store: BarStore | None = None
+    import os
+    if os.environ.get("DATABASE_URL"):
+        bar_store = BarStore(event_bus=bus)
+        bus.subscribe(EventType.BAR, bar_store.on_bar)
+        logger.info("bar_store_enabled")
+
     # ── Fill monitor ─────────────────────────────────────────
     fill_monitor = FillMonitor(bus, oms)
 
@@ -221,6 +230,8 @@ async def main() -> None:
 
     # Cleanup
     logger.info("bot_shutting_down")
+    if bar_store:
+        bar_store.close()
     await oms.close()
 
     for task in tasks:
