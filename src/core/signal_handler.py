@@ -200,7 +200,12 @@ class SignalHandler:
                          window_size=len(self._bar_window), bar_freq=bar_freq)
 
         except Exception as e:
-            logger.warning("warmup_databento_error", error=str(e))
+            import traceback
+            logger.critical(
+                "WARMUP_FAILED — signals will be garbage until enough bars accumulate",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
 
     async def on_tick(self, tick: TickEvent) -> None:
         """Forward ticks to OMS for paper bracket monitoring."""
@@ -216,6 +221,16 @@ class SignalHandler:
             self._bar_window.append(bar)
             if len(self._bar_window) > 500:
                 self._bar_window = self._bar_window[-500:]
+
+            # Don't compute signals until we have enough bars for meaningful values
+            if len(self._bar_window) < 30:
+                logger.info(
+                    "warmup_accumulating",
+                    window_size=len(self._bar_window),
+                    need=30,
+                )
+                return
+
             bundle = self._signal_engine.compute(self._bar_window)
 
             # Evaluate filters
