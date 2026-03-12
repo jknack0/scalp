@@ -325,12 +325,12 @@ class TradovateOMS(BaseOMS):
 
                     # Record exit to Postgres
                     if self._trade_store:
-                        from datetime import datetime, timezone
+                        from datetime import timezone as _tz
                         exit_dt = datetime.fromtimestamp(
-                            tick.timestamp_ns / 1e9, tz=timezone.utc,
+                            tick.timestamp_ns / 1e9, tz=_tz.utc,
                         )
                         entry_dt = datetime.fromtimestamp(
-                            order.created_at, tz=timezone.utc,
+                            order.created_at, tz=_tz.utc,
                         )
                         duration = (exit_dt - entry_dt).total_seconds()
                         self._trade_store.record_exit(
