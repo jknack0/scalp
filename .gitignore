@@ -19,9 +19,6 @@ wheels/
 # Tuning results (large, machine-specific)
 results/
 
-# Trained model artifacts (top-level only, not src/models/)
-/models/
-
 # Bot logs
 logs/
 
