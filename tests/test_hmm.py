@@ -67,10 +67,11 @@ def fitted_classifier(clustered_data: np.ndarray) -> HMMRegimeClassifier:
 
 class TestRegimeState:
     def test_enum_values(self):
-        """RegimeState has exactly 2 members with values 0-1."""
-        assert len(RegimeState) == 2
+        """RegimeState has 3 members with values 0-2."""
+        assert len(RegimeState) == 3
         assert RegimeState.RANGE_BOUND == 0
         assert RegimeState.VOLATILE == 1
+        assert RegimeState.TRENDING == 2
 
 
 class TestHMMClassifier:
@@ -92,12 +93,13 @@ class TestHMMClassifier:
         dist = np.linalg.norm(means[0] - means[1])
         assert dist > 0.01, "State means collapsed to same point"
 
-    def test_label_states_assigns_all_enum_values(
+    def test_label_states_assigns_all_model_states(
         self, fitted_classifier: HMMRegimeClassifier
     ):
-        """All 2 RegimeState values are present in state_map."""
-        assigned = set(fitted_classifier.state_map.values())
-        assert assigned == set(RegimeState)
+        """All HMM states are mapped to a RegimeState."""
+        n_states = fitted_classifier.config.n_states
+        assert len(fitted_classifier.state_map) == n_states
+        assert all(isinstance(v, RegimeState) for v in fitted_classifier.state_map.values())
 
     def test_predict_sequence_returns_correct_length(
         self,
@@ -183,7 +185,7 @@ class TestOnlinePredict:
             }
             try:
                 state = clf.predict(bar)
-                assert state in (0, 1)
+                assert state in (0, 1, 2)
             except NotReadyError:
                 continue
 
@@ -218,7 +220,7 @@ class TestOnlinePredict:
                 continue
 
         assert proba is not None
-        assert proba.shape == (2,)
+        assert proba.shape == (3,)
         assert proba.sum() == pytest.approx(1.0, abs=1e-6)
         assert all(p >= 0 for p in proba)
 
@@ -259,12 +261,13 @@ class TestEvaluation:
         fitted_classifier: HMMRegimeClassifier,
         clustered_data: np.ndarray,
     ):
-        """Transition matrix is (2,2) with rows summing to ~1."""
+        """Transition matrix is (3,3) with non-empty rows summing to ~1."""
         states = fitted_classifier.predict_sequence(clustered_data)
         tm = compute_transition_matrix(states)
-        assert tm.shape == (2, 2)
+        assert tm.shape == (3, 3)
         for row_sum in tm.sum(axis=1):
-            assert row_sum == pytest.approx(1.0, abs=1e-6)
+            # Rows with no transitions sum to 0 (unused states); active rows sum to 1
+            assert row_sum == pytest.approx(1.0, abs=1e-6) or row_sum == pytest.approx(0.0, abs=1e-6)
 
     def test_validate_model_structure(
         self,
@@ -277,8 +280,8 @@ class TestEvaluation:
         assert isinstance(report, HMMValidationReport)
         assert report.n_samples == len(clustered_data)
         assert 0.0 <= report.persistence_5bar <= 1.0
-        assert len(report.state_distribution) == 2
-        assert report.transition_matrix.shape == (2, 2)
+        assert len(report.state_distribution) == 3
+        assert report.transition_matrix.shape == (3, 3)
         assert isinstance(report.log_likelihood, float)
 
 

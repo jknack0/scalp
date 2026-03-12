@@ -46,7 +46,11 @@
       "Bash(wmic process:*)",
       "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/src --include=*.py)",
       "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/tests --include=*.py)",
-      "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/scripts --include=*.py)"
+      "Bash(grep -r \"ORBStrategy\\\\|VWAPReversionStrategy\\\\|NoiseBreakoutStrategy\\\\|intraday_momentum\" /c/Dev/scalp/scripts --include=*.py)",
+      "Bash(find c:Devscalp -name *hmm* -type f)",
+      "Bash(grep -E \"\\\\.\\(log|txt|json|yaml\\)$\")",
+      "Bash(xargs grep:*)",
+      "Bash(grep -r \"v4_2state\\\\|v3_3state\\\\|v2_5m\\\\|v1\" /c/Dev/scalp --include=*.py --include=*.md)"
     ],
     "additionalDirectories": [
       "C:\\Dev\\scalp\\.venv"

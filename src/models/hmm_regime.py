@@ -44,10 +44,11 @@ class NotReadyError(Exception):
 
 
 class RegimeState(IntEnum):
-    """Two intraday regime states."""
+    """Intraday regime states (2 or 3 state models)."""
 
     RANGE_BOUND = 0   # Low vol, mean-reverting — good for VWAP reversion
     VOLATILE = 1      # High vol / trending / crisis — avoid mean reversion
+    TRENDING = 2      # Moderate vol, directional — used by 3-state models
 
 
 DEFAULT_FEATURE_COLUMNS: list[str] = [
@@ -289,16 +290,17 @@ class HMMRegimeClassifier:
     def _label_states(self) -> None:
         """Map HMM components to semantic RegimeState via Hungarian algorithm.
 
-        Scoring heuristic for 2 states x 3 features:
+        Scoring heuristic (3 features: realized_vol, vpin_approx, return_autocorr):
         - RANGE_BOUND:  low realized_vol, low vpin, negative return_autocorr
-        - VOLATILE:     high realized_vol, high vpin
+        - VOLATILE:     high realized_vol, high vpin, positive autocorr
+        - TRENDING:     moderate vol, moderate vpin, positive autocorr (3-state only)
         """
         assert self.model is not None
         means = self.model.means_  # (n_states, 3)
 
-        # Feature indices: realized_vol=0, vpin_approx=1, return_autocorr=2
         n_states = means.shape[0]
-        n_regimes = len(RegimeState)
+        # Use only the regimes that match the model's state count
+        n_regimes = min(n_states, len(RegimeState))
         cost = np.zeros((n_states, n_regimes), dtype=np.float64)
 
         for s in range(n_states):
@@ -309,6 +311,10 @@ class HMMRegimeClassifier:
 
             # VOLATILE: high vol, high informed flow, trending
             cost[s, RegimeState.VOLATILE] = -(rvol + vpin + ret_ac)
+
+            # TRENDING (3-state): moderate vol, positive autocorr, low vpin
+            if n_regimes > 2:
+                cost[s, RegimeState.TRENDING] = -(0.5 * rvol + ret_ac - vpin)
 
         row_ind, col_ind = linear_sum_assignment(cost)
         self.state_map = {

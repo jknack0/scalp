@@ -6,7 +6,12 @@ Signals are pre-computed once; only filter thresholds + exit configs vary per co
 
 Entry params swept: deviation_sd, slope, adx, relative_volume
 Exit params swept: stop_atr, target_sd, time_bars, trailing_stop (on/off)
+
+Usage:
+  python scripts/tune/vwap_band_joint.py                         # default (YAML model)
+  python scripts/tune/vwap_band_joint.py --hmm models/hmm/v5_2state_full  # override HMM
 """
+import argparse
 import os, sys, time as _time, logging, math
 from collections import Counter
 from datetime import date, datetime, time, timedelta
@@ -183,12 +188,23 @@ def fast_run(bars, bundles, dates, times, et_times,
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hmm", type=str, default=None,
+                        help="Override HMM model path (default: use YAML config)")
+    args = parser.parse_args()
+
     yaml_path = "config/strategies/vwap_band_reversion.yaml"
     with open(yaml_path) as f:
         base_cfg = yaml.safe_load(f)
 
     signal_names = [s for s in base_cfg.get("signals", []) if s != "hmm_regime"]
     signal_configs = base_cfg.get("signal_configs", {})
+
+    # Override HMM model path if specified
+    if args.hmm:
+        signal_configs.setdefault("hmm_regime", {})["model_path"] = args.hmm
+        p(f"HMM model override: {args.hmm}")
+
     signal_engine = SignalEngine(signal_names, signal_configs)
 
     config = BacktestConfig(
