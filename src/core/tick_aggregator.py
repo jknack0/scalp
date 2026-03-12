@@ -65,6 +65,7 @@ class TickAggregator:
         self._bar = _BarAccumulator()
         self._running = False
         self._bar_count = 0
+        self._last_price: float = 0.0
 
     async def on_tick(self, tick: TickEvent) -> None:
         """Accumulate a tick into the current bar."""
@@ -76,6 +77,12 @@ class TickAggregator:
 
         if price <= 0:
             return
+
+        # Reject outlier ticks (spread instruments, bad data)
+        # If we have a reference price, reject ticks >20% away
+        if self._last_price > 0 and abs(price - self._last_price) / self._last_price > 0.20:
+            return
+        self._last_price = price
 
         bar = self._bar
         if bar.is_empty():
