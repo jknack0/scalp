@@ -55,6 +55,7 @@ class SignalHandler:
         self._filter_engine = filter_engine or FilterEngine()
         self._trade_store = trade_store
         self._bar_window: list[BarEvent] = []
+        self._bar_count: int = 0
 
     def wire(self) -> None:
         """Subscribe to relevant events on the bus."""
@@ -73,6 +74,8 @@ class SignalHandler:
 
     async def on_bar(self, bar: BarEvent) -> None:
         """Feed bar to all strategies and handle any signals."""
+        self._bar_count += 1
+
         # Compute signals bundle
         bundle = EMPTY_BUNDLE
         if self._signal_engine is not None:
@@ -83,6 +86,11 @@ class SignalHandler:
 
             # Evaluate filters
             filter_result = self._filter_engine.evaluate(bundle)
+
+            # Log signal + filter snapshot every 60 bars (~1 min)
+            if self._bar_count % 60 == 0:
+                self._log_snapshot(bar, bundle, filter_result)
+
             if not filter_result.passes:
                 return
 
@@ -165,6 +173,41 @@ class SignalHandler:
                 regime=signal.regime_state.name if signal.regime_state else "UNKNOWN",
                 metadata=signal.metadata,
             )
+
+    def _log_snapshot(self, bar: BarEvent, bundle: SignalBundle, filter_result) -> None:
+        """Log current signal values and filter status (periodic, every ~1 min)."""
+        snap: dict = {"close": bar.close, "bars": self._bar_count}
+
+        # Key signal values
+        for name in ("adx", "atr", "relative_volume", "regime_v2", "vwap_session"):
+            result = bundle.get(name)
+            if result is None:
+                continue
+            if name == "regime_v2":
+                meta = result.metadata
+                snap["regime"] = meta.get("regime", "?")
+                snap["regime_conf"] = round(meta.get("confidence", 0), 3)
+                snap["regime_size"] = meta.get("position_size", "?")
+                snap["regime_halt"] = meta.get("whipsaw_halt", False)
+                snap["regime_passes"] = result.passes
+            elif name == "vwap_session":
+                meta = result.metadata
+                snap["vwap_dev_sd"] = round(meta.get("deviation_sd", 0), 2)
+                snap["vwap_slope"] = round(meta.get("slope", 0), 4)
+                snap["vwap_age"] = meta.get("session_age_bars", 0)
+            elif name == "adx":
+                snap["adx"] = round(result.value, 1)
+            elif name == "atr":
+                snap["atr"] = round(result.metadata.get("atr_raw", 0), 2)
+            elif name == "relative_volume":
+                snap["rvol"] = round(result.value, 2)
+
+        # Filter status
+        snap["filters_pass"] = filter_result.passes
+        if not filter_result.passes:
+            snap["blocked_by"] = filter_result.block_reasons[:3]
+
+        logger.info("signal_snapshot", **snap)
 
     async def session_close(self) -> None:
         """End-of-session cleanup: flatten position, reset strategies."""
