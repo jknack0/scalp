@@ -124,6 +124,16 @@ class SignalHandler:
                 logger.info("warmup_no_data", symbol=symbol)
                 return
 
+            # Filter to RTH only (14:30-21:00 UTC = 9:30 AM-4:00 PM ET)
+            # Prevents session-gap artifacts from inflating ATR/true range
+            df = df[
+                (df.index.hour * 60 + df.index.minute >= 14 * 60 + 30)
+                & (df.index.hour * 60 + df.index.minute < 21 * 60)
+            ]
+            if df.empty:
+                logger.info("warmup_no_rth_data", symbol=symbol)
+                return
+
             # Resample 1m → target freq if needed
             if freq_seconds > 60:
                 df_pl = pl.DataFrame({

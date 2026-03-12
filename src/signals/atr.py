@@ -62,6 +62,17 @@ class ATRSignal(SignalBase):
         n = len(bars)
         true_ranges = np.empty(n, dtype=np.float64)
 
+        # Compute gap threshold: 3× median inter-bar interval
+        # Bars separated by more than this are across a session gap
+        if n > 2:
+            deltas = np.array([
+                bars[i].timestamp_ns - bars[i - 1].timestamp_ns
+                for i in range(1, min(n, 50))  # sample first 50 pairs
+            ])
+            self._max_gap_ns = int(np.median(deltas) * 3)
+        else:
+            self._max_gap_ns = 10 * 60 * 1_000_000_000  # fallback 10 min
+
         # First bar: TR = high - low (no previous close)
         true_ranges[0] = bars[0].high - bars[0].low
 
@@ -69,7 +80,13 @@ class ATRSignal(SignalBase):
             h = bars[i].high
             l = bars[i].low
             pc = bars[i - 1].close
-            true_ranges[i] = max(h - l, abs(h - pc), abs(l - pc))
+            # Detect session gaps: if bars are more than 3× the median
+            # interval apart, use H-L only (prevClose across gap inflates TR)
+            gap_ns = bars[i].timestamp_ns - bars[i - 1].timestamp_ns
+            if gap_ns > self._max_gap_ns:
+                true_ranges[i] = h - l
+            else:
+                true_ranges[i] = max(h - l, abs(h - pc), abs(l - pc))
 
         # ----------------------------------------------------------
         # 2. Wilder-smoothed ATR (incremental)
