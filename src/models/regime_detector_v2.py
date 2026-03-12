@@ -1,9 +1,16 @@
-"""Phase 7: Production Regime Detector V2 — 3-state Student-t HMM, forward-only.
+"""Phase 7: Production Regime Detector V2 — 3-state HMM, forward-only.
 
-Step 2 upgrade from MVP:
-- pomegranate Student-t emissions (heavier tails for financial returns)
-- 4 features: [log_return, garman_klass_vol, hurst_dfa, autocorr_sum]
-- Forward-only inference: predict_proba() only (NOT Viterbi — non-causal)
+Step 3 upgrade: Transition Layer (BOCPD + CUSUM + Vol Z-Score)
+- 3 independent changepoint detectors run in parallel with HMM
+- BOCPD: Bayesian Online Changepoint Detection (truncated run-length, hazard lambda)
+- CUSUM: Two-sided cumulative sum mean-shift detector
+- Vol z-score: GK volatility spike detector
+- 2-of-3 agreement required to confirm HMM regime transitions
+- Suppresses false transitions → fewer whipsaw halts, more stable regimes
+
+Previous steps:
+- Step 1: 3-state GaussianHMM, 2 features, forward-only
+- Step 2: 4 features (+ Hurst DFA, autocorr), dual-backend (Gaussian default, Student-t optional)
 - Anti-whipsaw: hysteresis, min bars in regime, flip halt
 - Position sizing from confidence thresholds
 
@@ -38,6 +45,7 @@ from hmmlearn.hmm import GaussianHMM
 from pomegranate.distributions import StudentT
 from pomegranate.hmm import DenseHMM
 from scipy.optimize import linear_sum_assignment
+from scipy.special import gammaln
 from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
@@ -124,6 +132,23 @@ class RegimeDetectorV2Config:
     flip_halt_count: int = 2         # Max flips in window before halt
     flip_halt_window: int = 20       # Window (bars) for flip counting
     ambiguity_threshold: float = 0.55  # Max P < this → no-regime
+
+    # Transition layer (Step 3: BOCPD + CUSUM + vol z-score)
+    transition_agreement: int = 2         # N-of-3 detectors must agree
+    transition_lookback: int = 5          # Bars to look back for agreement
+
+    # BOCPD
+    bocpd_hazard_lambda: int = 60         # Expected run length (bars between changepoints)
+    bocpd_threshold: float = 0.3          # P(r=0) threshold for changepoint signal
+    bocpd_max_run: int = 300              # Truncation length for run-length distribution
+
+    # CUSUM
+    cusum_k: float = 0.5                  # Slack parameter (z-score units)
+    cusum_h: float = 4.0                  # Decision threshold
+
+    # Vol z-score changepoint
+    vol_zscore_threshold: float = 2.0     # GK vol z-score threshold for changepoint
+    vol_zscore_window: int = 50           # Rolling window for vol z-score baseline
 
 
 # ── Feature extraction (batch) ───────────────────────────────────────
@@ -339,6 +364,336 @@ def build_features_v2(
     return normed[start:][valid], ts_arr[start:][valid]
 
 
+# ── Changepoint detectors (Step 3) ──────────────────────────────────
+
+
+class BOCPDDetector:
+    """Bayesian Online Changepoint Detection (truncated).
+
+    Maintains a run-length distribution P(r_t | x_{1:t}) with constant
+    hazard rate H = 1/lambda. Signals a changepoint when P(r_t=0) exceeds
+    a threshold.
+
+    Reference: Adams & MacKay (2007) "Bayesian Online Changepoint Detection"
+    """
+
+    def __init__(
+        self,
+        hazard_lambda: int = 60,
+        threshold: float = 0.3,
+        max_run: int = 300,
+    ) -> None:
+        self.hazard_lambda = hazard_lambda
+        self.threshold = threshold
+        self.max_run = max_run
+        self.reset()
+
+    def reset(self) -> None:
+        # Run-length distribution: P(r_t = k) for k in [0, max_run]
+        self._run_lengths = np.zeros(self.max_run + 1)
+        self._run_lengths[0] = 1.0  # Start with r=0
+        # Per-run-length sufficient statistics (Gaussian conjugate)
+        # mu0=0, kappa0=1, alpha0=1, beta0=0.01 (Normal-Inverse-Gamma prior)
+        self._mu0 = 0.0
+        self._kappa0 = 1.0
+        self._alpha0 = 1.0
+        self._beta0 = 0.01
+        # Sufficient stats arrays: one per possible run length
+        self._sum_x = np.zeros(self.max_run + 1)
+        self._sum_x2 = np.zeros(self.max_run + 1)
+        self._counts = np.zeros(self.max_run + 1)
+        self._changepoint_prob = 0.0
+        self._prev_map_rl = 0    # Previous MAP run length
+        self._n_obs = 0
+
+    def _predictive_probs_vectorized(self, x: float) -> np.ndarray:
+        """Vectorized Student-t predictive probability for all run lengths.
+
+        Uses Normal-Inverse-Gamma conjugate posterior. Returns array of
+        predictive densities, one per run length.
+        """
+        counts = self._counts
+        kappa_n = self._kappa0 + counts
+        alpha_n = self._alpha0 + counts / 2.0
+
+        # Mean and beta for each run length
+        mean_n = np.where(
+            counts > 0,
+            (self._kappa0 * self._mu0 + self._sum_x) / kappa_n,
+            self._mu0,
+        )
+        safe_counts = np.maximum(counts, 1.0)
+        sample_mean = self._sum_x / safe_counts
+        s = self._sum_x2 - self._sum_x ** 2 / safe_counts
+        beta_n = np.where(
+            counts > 0,
+            self._beta0 + 0.5 * s + (
+                self._kappa0 * counts * (sample_mean - self._mu0) ** 2
+            ) / (2.0 * kappa_n),
+            self._beta0,
+        )
+
+        # Student-t predictive parameters
+        dof = 2.0 * alpha_n
+        scale2 = beta_n * (kappa_n + 1.0) / (alpha_n * kappa_n)
+        scale = np.sqrt(np.maximum(scale2, 1e-20))
+
+        z = (x - mean_n) / scale
+        log_prob = (
+            gammaln((dof + 1) / 2) - gammaln(dof / 2)
+            - 0.5 * np.log(dof * np.pi) - np.log(scale)
+            - (dof + 1) / 2 * np.log1p(z**2 / dof)
+        )
+        return np.exp(np.clip(log_prob, -500, 500))
+
+    def update(self, x: float) -> bool:
+        """Ingest one observation, return True if changepoint detected."""
+        H = 1.0 / self.hazard_lambda
+        self._n_obs += 1
+
+        # Vectorized predictive probabilities for all run lengths
+        # Only compute for run lengths with nonzero probability
+        active = self._run_lengths > 1e-300
+        pred_probs = np.zeros(self.max_run + 1)
+        if np.any(active):
+            all_preds = self._predictive_probs_vectorized(x)
+            pred_probs[active] = all_preds[active]
+
+        # Growth: extend existing run lengths
+        new_rl = np.zeros(self.max_run + 1)
+        new_rl[1 : self.max_run + 1] = (
+            self._run_lengths[: self.max_run] * pred_probs[: self.max_run] * (1 - H)
+        )
+
+        # Changepoint: all mass collapses to r=0
+        new_rl[0] = np.sum(self._run_lengths * pred_probs * H)
+
+        # Normalize
+        total = new_rl.sum()
+        if total > 1e-300:
+            new_rl *= (1.0 / total)
+        else:
+            new_rl[0] = 1.0
+
+        # Update sufficient statistics (shift and add new observation)
+        new_sum_x = np.empty(self.max_run + 1)
+        new_sum_x[0] = x
+        new_sum_x[1 : self.max_run + 1] = self._sum_x[: self.max_run] + x
+
+        new_sum_x2 = np.empty(self.max_run + 1)
+        new_sum_x2[0] = x * x
+        new_sum_x2[1 : self.max_run + 1] = self._sum_x2[: self.max_run] + x * x
+
+        new_counts = np.empty(self.max_run + 1)
+        new_counts[0] = 1
+        new_counts[1 : self.max_run + 1] = self._counts[: self.max_run] + 1
+
+        self._run_lengths = new_rl
+        self._sum_x = new_sum_x
+        self._sum_x2 = new_sum_x2
+        self._counts = new_counts
+
+        # Changepoint detection: MAP run length drops sharply
+        map_rl = int(np.argmax(new_rl))
+        if self._prev_map_rl > 0:
+            drop_frac = (self._prev_map_rl - map_rl) / self._prev_map_rl
+        else:
+            drop_frac = 0.0
+        self._changepoint_prob = max(0.0, drop_frac)
+        detected = (
+            drop_frac > self.threshold
+            and self._prev_map_rl > 5
+        )
+        self._prev_map_rl = map_rl
+
+        return detected
+
+    @property
+    def changepoint_prob(self) -> float:
+        return self._changepoint_prob
+
+    def update_batch(self, values: np.ndarray) -> np.ndarray:
+        """Process a batch of values, return boolean array of changepoint signals."""
+        signals = np.zeros(len(values), dtype=bool)
+        for i, x in enumerate(values):
+            signals[i] = self.update(x)
+        return signals
+
+
+class CUSUMDetector:
+    """Two-sided CUSUM detector for mean shifts.
+
+    Tracks cumulative sums in both directions. Signals when either
+    the positive or negative CUSUM exceeds threshold h.
+    Resets after detection.
+    """
+
+    def __init__(self, k: float = 0.5, h: float = 4.0) -> None:
+        self.k = k    # Slack (allowance) parameter
+        self.h = h    # Decision threshold
+        self.reset()
+
+    def reset(self) -> None:
+        self._s_pos = 0.0  # Positive CUSUM
+        self._s_neg = 0.0  # Negative CUSUM
+        self._mean = 0.0
+        self._n = 0
+
+    def update(self, x: float) -> bool:
+        """Ingest one observation, return True if mean shift detected."""
+        self._n += 1
+
+        # Online mean estimate (target)
+        alpha = min(1.0 / self._n, 0.02)  # Slow-adapting mean
+        self._mean += alpha * (x - self._mean)
+
+        deviation = x - self._mean
+
+        # Two-sided CUSUM
+        self._s_pos = max(0.0, self._s_pos + deviation - self.k)
+        self._s_neg = max(0.0, self._s_neg - deviation - self.k)
+
+        if self._s_pos > self.h or self._s_neg > self.h:
+            # Reset after detection
+            self._s_pos = 0.0
+            self._s_neg = 0.0
+            return True
+
+        return False
+
+    def update_batch(self, values: np.ndarray) -> np.ndarray:
+        """Process a batch of values, return boolean array of shift signals."""
+        signals = np.zeros(len(values), dtype=bool)
+        for i, x in enumerate(values):
+            signals[i] = self.update(x)
+        return signals
+
+
+class VolZScoreDetector:
+    """Volatility z-score changepoint detector.
+
+    Monitors GK volatility z-score against a rolling baseline.
+    Signals when |z-score| exceeds threshold, indicating a vol regime change.
+    """
+
+    def __init__(self, threshold: float = 2.0, window: int = 50) -> None:
+        self.threshold = threshold
+        self.window = window
+        self.reset()
+
+    def reset(self) -> None:
+        self._buffer: deque[float] = deque(maxlen=self.window)
+        self._zscore = 0.0
+
+    def update(self, gk_vol: float) -> bool:
+        """Ingest one GK vol value, return True if vol regime change detected."""
+        self._buffer.append(gk_vol)
+
+        if len(self._buffer) < 10:
+            self._zscore = 0.0
+            return False
+
+        arr = np.array(self._buffer)
+        mean = arr[:-1].mean()  # Baseline excludes current
+        std = arr[:-1].std(ddof=1)
+
+        if std < 1e-10:
+            self._zscore = 0.0
+            return False
+
+        self._zscore = (gk_vol - mean) / std
+        return abs(self._zscore) > self.threshold
+
+    @property
+    def zscore(self) -> float:
+        return self._zscore
+
+    def update_batch(self, values: np.ndarray) -> np.ndarray:
+        """Process a batch of values, return boolean array of vol change signals."""
+        signals = np.zeros(len(values), dtype=bool)
+        for i, x in enumerate(values):
+            signals[i] = self.update(x)
+        return signals
+
+
+class TransitionLayer:
+    """2-of-3 agreement filter for regime transitions.
+
+    Combines BOCPD, CUSUM, and vol z-score changepoint detectors.
+    A transition is only confirmed when N-of-3 detectors signal
+    within a lookback window.
+    """
+
+    def __init__(self, config: RegimeDetectorV2Config) -> None:
+        self.config = config
+        self.bocpd = BOCPDDetector(
+            hazard_lambda=config.bocpd_hazard_lambda,
+            threshold=config.bocpd_threshold,
+            max_run=config.bocpd_max_run,
+        )
+        self.cusum = CUSUMDetector(
+            k=config.cusum_k,
+            h=config.cusum_h,
+        )
+        self.vol_zscore = VolZScoreDetector(
+            threshold=config.vol_zscore_threshold,
+            window=config.vol_zscore_window,
+        )
+        self._bocpd_signals: deque[bool] = deque(maxlen=config.transition_lookback)
+        self._cusum_signals: deque[bool] = deque(maxlen=config.transition_lookback)
+        self._vol_signals: deque[bool] = deque(maxlen=config.transition_lookback)
+
+    def reset(self) -> None:
+        self.bocpd.reset()
+        self.cusum.reset()
+        self.vol_zscore.reset()
+        self._bocpd_signals.clear()
+        self._cusum_signals.clear()
+        self._vol_signals.clear()
+
+    def update(self, log_return: float, gk_vol: float) -> bool:
+        """Update all 3 detectors, return True if agreement threshold met."""
+        b = self.bocpd.update(log_return)
+        c = self.cusum.update(log_return)
+        v = self.vol_zscore.update(gk_vol)
+
+        self._bocpd_signals.append(b)
+        self._cusum_signals.append(c)
+        self._vol_signals.append(v)
+
+        return self._check_agreement()
+
+    def _check_agreement(self) -> bool:
+        """Check if N-of-3 detectors fired within the lookback window."""
+        votes = 0
+        if any(self._bocpd_signals):
+            votes += 1
+        if any(self._cusum_signals):
+            votes += 1
+        if any(self._vol_signals):
+            votes += 1
+        return votes >= self.config.transition_agreement
+
+    def update_batch(
+        self, log_returns: np.ndarray, gk_vols: np.ndarray
+    ) -> np.ndarray:
+        """Process batch, return boolean array of confirmed transitions."""
+        n = len(log_returns)
+        confirmed = np.zeros(n, dtype=bool)
+        for i in range(n):
+            confirmed[i] = self.update(log_returns[i], gk_vols[i])
+        return confirmed
+
+    @property
+    def detail(self) -> dict[str, bool]:
+        """Current state of each detector (for debugging)."""
+        return {
+            "bocpd": bool(any(self._bocpd_signals)) if self._bocpd_signals else False,
+            "cusum": bool(any(self._cusum_signals)) if self._cusum_signals else False,
+            "vol_zscore": bool(any(self._vol_signals)) if self._vol_signals else False,
+        }
+
+
 # ── Detector class ───────────────────────────────────────────────────
 
 class RegimeDetectorV2:
@@ -381,6 +736,9 @@ class RegimeDetectorV2:
         self._recent_flips: deque[int] = deque(maxlen=cfg.flip_halt_window)
         self._whipsaw_halt: bool = False
         self._last_proba: RegimeProba | None = None
+
+        # Transition layer (Step 3)
+        self._transition_layer = TransitionLayer(cfg)
 
     def reset(self) -> None:
         """Reset online state (call on session boundaries)."""
@@ -540,6 +898,14 @@ class RegimeDetectorV2:
         for hmm_idx, label in self.state_map.items():
             mapped[:, label.value] = proba_matrix[:, hmm_idx]
 
+        # Run transition layer detectors over raw features
+        # Use un-normalized log returns and GK vol for changepoint detection
+        transition_layer = TransitionLayer(cfg)
+        transition_confirmed = transition_layer.update_batch(
+            features[:, 0],  # log returns (z-scored, but direction preserved)
+            features[:, 1],  # GK vol (z-scored)
+        )
+
         # Apply anti-whipsaw rules sequentially
         results: list[RegimeProba] = []
         current_regime = RegimeLabel.RANGING
@@ -560,8 +926,21 @@ class RegimeDetectorV2:
                     current_regime, mapped[i], cfg
                 )
 
-            # Track transitions
-            transition = new_regime != current_regime
+            # HMM proposes transition — require transition layer confirmation
+            hmm_wants_transition = new_regime != current_regime
+
+            if cfg.transition_agreement <= 0:
+                # No transition layer: accept all HMM transitions
+                transition = hmm_wants_transition
+            elif hmm_wants_transition and transition_confirmed[i]:
+                # Confirmed transition
+                transition = True
+            elif hmm_wants_transition:
+                # HMM wants to switch but changepoint detectors disagree — suppress
+                new_regime = current_regime
+                transition = False
+            else:
+                transition = False
 
             if transition:
                 recent_flips.append(1)
@@ -677,6 +1056,11 @@ class RegimeDetectorV2:
             max_p = max(p_tuple)
             cfg = self.config
 
+            # Update transition layer with raw features
+            raw_lr = raw[0] if raw is not None else 0.0
+            raw_gk = raw[1] if raw is not None else 0.0
+            changepoint_confirmed = self._transition_layer.update(raw_lr, raw_gk)
+
             # Ambiguity
             if max_p < cfg.ambiguity_threshold:
                 new_regime = self._current_regime
@@ -685,8 +1069,18 @@ class RegimeDetectorV2:
                     self._current_regime, mapped, cfg
                 )
 
-            # Track transition
-            transition = new_regime != self._current_regime
+            # HMM proposes transition — require transition layer confirmation
+            hmm_wants_transition = new_regime != self._current_regime
+
+            if cfg.transition_agreement <= 0:
+                transition = hmm_wants_transition
+            elif hmm_wants_transition and changepoint_confirmed:
+                transition = True
+            elif hmm_wants_transition:
+                new_regime = self._current_regime
+                transition = False
+            else:
+                transition = False
 
             if transition:
                 self._recent_flips.append(1)

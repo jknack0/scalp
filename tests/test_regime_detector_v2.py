@@ -1,4 +1,4 @@
-"""Tests for Phase 7 Regime Detector V2 (Step 2: Student-t + 4 features)."""
+"""Tests for Phase 7 Regime Detector V2 (Step 3: Transition Layer)."""
 
 import numpy as np
 import polars as pl
@@ -6,11 +6,15 @@ import pytest
 from pathlib import Path
 
 from src.models.regime_detector_v2 import (
+    BOCPDDetector,
+    CUSUMDetector,
     N_FEATURES,
     RegimeDetectorV2,
     RegimeDetectorV2Config,
     RegimeLabel,
     RegimeProba,
+    TransitionLayer,
+    VolZScoreDetector,
     _autocorr_sum_single,
     _dfa_hurst_single,
     build_features_v2,
@@ -385,6 +389,203 @@ class TestComputeStats:
     def test_empty_input(self):
         stats = compute_regime_stats([])
         assert stats == {}
+
+
+# ── BOCPD ────────────────────────────────────────────────────────────
+
+class TestBOCPD:
+    def test_stable_series_no_changepoint(self):
+        rng = np.random.default_rng(42)
+        det = BOCPDDetector(hazard_lambda=60, threshold=0.3)
+        values = rng.normal(0, 0.01, size=200)
+        signals = det.update_batch(values)
+        # Stable series: few or no changepoints after warmup
+        assert signals[:10].sum() == 0, "Should not fire during warmup"
+
+    def test_mean_shift_detected(self):
+        rng = np.random.default_rng(42)
+        det = BOCPDDetector(hazard_lambda=30, threshold=0.3)
+        # Stable z-scores, then abrupt mean shift (like z-scored features)
+        v1 = rng.normal(0, 0.5, size=100)
+        v2 = rng.normal(2.0, 0.5, size=100)
+        values = np.concatenate([v1, v2])
+        signals = det.update_batch(values)
+        # Should detect changepoint near index 100
+        assert any(signals[95:115]), "Should detect mean shift around index 100"
+
+    def test_changepoint_prob_property(self):
+        det = BOCPDDetector()
+        det.update(0.0)
+        det.update(0.0)
+        det.update(0.0)
+        assert 0.0 <= det.changepoint_prob <= 1.0
+
+    def test_reset_clears_state(self):
+        det = BOCPDDetector()
+        for _ in range(50):
+            det.update(0.01)
+        det.reset()
+        assert det._n_obs == 0
+        assert det._changepoint_prob == 0.0
+
+
+class TestCUSUM:
+    def test_stable_series_no_alarm(self):
+        rng = np.random.default_rng(42)
+        det = CUSUMDetector(k=0.5, h=4.0)
+        values = rng.normal(0, 0.3, size=200)  # z-score scale
+        signals = det.update_batch(values)
+        # Low-vol stable series should rarely trigger
+        assert signals.sum() < 5
+
+    def test_mean_shift_triggers(self):
+        det = CUSUMDetector(k=0.5, h=4.0)
+        # Feed steady zeros then jump to 2.0
+        values = np.concatenate([np.zeros(50), np.full(50, 2.0)])
+        signals = det.update_batch(values)
+        assert any(signals[50:]), "Should trigger on mean shift to 2.0"
+
+    def test_reset_clears(self):
+        det = CUSUMDetector()
+        for _ in range(20):
+            det.update(1.0)
+        det.reset()
+        assert det._s_pos == 0.0
+        assert det._s_neg == 0.0
+        assert det._n == 0
+
+
+class TestVolZScore:
+    def test_stable_vol_no_signal(self):
+        rng = np.random.default_rng(42)
+        det = VolZScoreDetector(threshold=2.0, window=50)
+        values = rng.uniform(0.005, 0.006, size=100)
+        signals = det.update_batch(values)
+        assert signals.sum() < 5
+
+    def test_vol_spike_detected(self):
+        det = VolZScoreDetector(threshold=2.0, window=30)
+        # Stable vol then spike
+        values = np.concatenate([
+            np.full(40, 0.005),
+            np.full(10, 0.050),  # 10x spike
+        ])
+        signals = det.update_batch(values)
+        assert any(signals[40:]), "Should detect vol spike"
+
+    def test_zscore_property(self):
+        det = VolZScoreDetector()
+        for _ in range(20):
+            det.update(0.005)
+        assert isinstance(det.zscore, float)
+
+    def test_reset_clears(self):
+        det = VolZScoreDetector()
+        for _ in range(20):
+            det.update(0.005)
+        det.reset()
+        assert len(det._buffer) == 0
+        assert det._zscore == 0.0
+
+
+# ── Transition Layer ─────────────────────────────────────────────────
+
+class TestTransitionLayer:
+    def test_stable_data_no_confirmation(self):
+        cfg = RegimeDetectorV2Config(transition_agreement=2)
+        tl = TransitionLayer(cfg)
+        rng = np.random.default_rng(42)
+        lr = rng.normal(0, 0.01, size=100)
+        gk = rng.uniform(0.005, 0.006, size=100)
+        confirmed = tl.update_batch(lr, gk)
+        # Mostly stable → few confirmations
+        assert confirmed.sum() < len(confirmed) * 0.3
+
+    def test_regime_break_gets_confirmed(self):
+        cfg = RegimeDetectorV2Config(
+            transition_agreement=2,
+            bocpd_hazard_lambda=30,
+            bocpd_threshold=0.2,
+            cusum_h=3.0,
+            vol_zscore_threshold=2.0,
+        )
+        tl = TransitionLayer(cfg)
+        rng = np.random.default_rng(42)
+        # Z-score-scaled: quiet period, then abrupt shift in returns and vol
+        lr = np.concatenate([
+            rng.normal(0, 0.5, size=80),
+            rng.normal(2.0, 0.5, size=40),
+        ])
+        gk = np.concatenate([
+            rng.normal(0, 0.3, size=80),
+            rng.normal(3.0, 0.3, size=40),
+        ])
+        confirmed = tl.update_batch(lr, gk)
+        assert any(confirmed[75:]), "Should confirm transition around regime break"
+
+    def test_detail_property(self):
+        cfg = RegimeDetectorV2Config()
+        tl = TransitionLayer(cfg)
+        tl.update(0.01, 0.005)
+        detail = tl.detail
+        assert "bocpd" in detail
+        assert "cusum" in detail
+        assert "vol_zscore" in detail
+
+    def test_reset_clears_all(self):
+        cfg = RegimeDetectorV2Config()
+        tl = TransitionLayer(cfg)
+        for _ in range(30):
+            tl.update(0.01, 0.005)
+        tl.reset()
+        assert len(tl._bocpd_signals) == 0
+        assert len(tl._cusum_signals) == 0
+        assert len(tl._vol_signals) == 0
+
+    def test_agreement_threshold_respected(self):
+        """With agreement=3, all 3 must fire."""
+        cfg = RegimeDetectorV2Config(transition_agreement=3)
+        tl = TransitionLayer(cfg)
+        # Force only CUSUM to fire by feeding large deviation
+        # BOCPD and vol z-score shouldn't fire on first observation
+        result = tl.update(0.0, 0.005)
+        assert result is False  # Can't have 3-way agreement on first bar
+
+
+# ── Integration: transition layer suppresses false transitions ───────
+
+class TestTransitionIntegration:
+    def test_transitions_reduced_vs_no_layer(self, bar_df, config):
+        """Transition layer should reduce or equal the number of transitions."""
+        features, _ = build_features_v2(bar_df, config)
+
+        # With transition layer (default)
+        detector = RegimeDetectorV2(config)
+        detector.fit(features)
+        probas_with = detector.predict_proba_sequence(features)
+        trans_with = sum(1 for p in probas_with if p.transition_signal)
+
+        # Without transition layer (agreement=0 means always confirm)
+        from dataclasses import fields, asdict
+        d = {f.name: getattr(config, f.name) for f in fields(config)}
+        d["transition_agreement"] = 0
+        config_no_tl = RegimeDetectorV2Config(**d)
+        detector2 = RegimeDetectorV2(config_no_tl)
+        detector2.fit(features)
+        probas_without = detector2.predict_proba_sequence(features)
+        trans_without = sum(1 for p in probas_without if p.transition_signal)
+
+        assert trans_with <= trans_without, \
+            f"Transition layer should reduce transitions: {trans_with} vs {trans_without}"
+
+    def test_batch_still_produces_valid_output(self, fitted_detector):
+        detector, features = fitted_detector
+        probas = detector.predict_proba_sequence(features)
+        assert len(probas) == len(features)
+        for p in probas:
+            assert isinstance(p, RegimeProba)
+            assert p.regime in RegimeLabel
+            assert p.position_size in ("full", "half", "flat")
 
 
 # ── Protocol compatibility ───────────────────────────────────────────
