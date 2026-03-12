@@ -158,7 +158,23 @@ async def main() -> None:
         filter_engine=filter_engine,
         trade_store=trade_store,
     )
-    handler.wire()
+
+    # ── Bar resampler (1s → strategy freq, e.g. 5m) ──────────
+    from src.core.bar_resampler import BarResampler, _freq_to_seconds
+    from src.core.events import EventType
+
+    bar_cfg = yaml_cfg.get("bar", {})
+    bar_freq = bar_cfg.get("freq", "1s")
+    bar_freq_seconds = _freq_to_seconds(bar_freq)
+
+    resampler: BarResampler | None = None
+    if bar_freq_seconds > 1:
+        resampler = BarResampler(freq_seconds=bar_freq_seconds, callback=handler.on_bar)
+        handler.wire(subscribe_bar=False)  # resampler routes bars instead
+        bus.subscribe(EventType.BAR, resampler.on_bar)
+        logger.info("bar_resampler_enabled", freq=bar_freq, seconds=bar_freq_seconds)
+    else:
+        handler.wire()
 
     # Warm up signals from Databento historical bars
     if config.databento_api_key:
@@ -166,6 +182,7 @@ async def main() -> None:
             symbol=config.symbol,
             api_key=config.databento_api_key,
             bars=600,
+            bar_freq=bar_freq,
         )
 
     # ── Tick aggregator (ticks → bars) ───────────────────────
@@ -174,7 +191,6 @@ async def main() -> None:
         symbol=config.symbol,
         interval_seconds=args.bar_interval,
     )
-    from src.core.events import EventType
     bus.subscribe(EventType.TICK, aggregator.on_tick)
 
     # ── Bar store (persist 1m bars to Postgres) ──────────────

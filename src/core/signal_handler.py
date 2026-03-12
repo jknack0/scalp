@@ -57,9 +57,14 @@ class SignalHandler:
         self._bar_window: list[BarEvent] = []
         self._bar_count: int = 0
 
-    def wire(self) -> None:
-        """Subscribe to relevant events on the bus."""
-        self._bus.subscribe(EventType.BAR, self.on_bar)
+    def wire(self, subscribe_bar: bool = True) -> None:
+        """Subscribe to relevant events on the bus.
+
+        If subscribe_bar=False, BAR events are NOT subscribed — the caller
+        is responsible for routing bars (e.g. via a BarResampler).
+        """
+        if subscribe_bar:
+            self._bus.subscribe(EventType.BAR, self.on_bar)
         self._bus.subscribe(EventType.TICK, self.on_tick)
         self._bus.subscribe(EventType.FILL, self.on_fill)
         logger.info(
@@ -68,16 +73,17 @@ class SignalHandler:
             paper=self._oms.is_paper,
         )
 
-    def warmup_from_databento(self, symbol: str, api_key: str, bars: int = 600) -> None:
+    def warmup_from_databento(
+        self, symbol: str, api_key: str, bars: int = 600, bar_freq: str = "1m",
+    ) -> None:
         """Pre-feed historical bars from Databento to warm up signals.
 
-        Pulls the last N 1m OHLCV bars via Databento Historical API,
-        converts to BarEvents, and runs the signal engine on them so
-        regime detector, ADX, ATR, VWAP, etc. all have context on first
-        live bar.
+        Pulls 1m OHLCV bars via Databento Historical API, resamples to
+        bar_freq if needed, converts to BarEvents, and runs the signal
+        engine so regime detector, ADX, ATR, VWAP, etc. have context.
 
-        The regime detector needs ~500+ bars (hurst_window=250, warmup_bars=300,
-        zscore_window=500), so default is 600 bars (~10 hours of 1m data).
+        bars: number of target-frequency bars desired (e.g. 600 5m bars).
+        bar_freq: target bar frequency matching strategy YAML (e.g. "5m").
         """
         if self._signal_engine is None:
             return
@@ -87,14 +93,19 @@ class SignalHandler:
 
         try:
             import databento as db
+            import polars as pl
             from datetime import datetime, timedelta, timezone
+            from src.core.bar_resampler import _freq_to_seconds
+
+            freq_seconds = _freq_to_seconds(bar_freq)
+            # How many 1m bars do we need to get `bars` target-freq bars?
+            bars_1m_needed = bars * max(freq_seconds // 60, 1)
 
             client = db.Historical(key=api_key)
 
-            # Pull recent 1m bars — request extra time window to account
-            # for overnight gaps and weekend closures
-            end = datetime.now(timezone.utc) - timedelta(minutes=30)  # Databento lags ~15-20 min
-            start = end - timedelta(minutes=bars * 3)
+            # Request extra time window to account for overnight gaps
+            end = datetime.now(timezone.utc) - timedelta(minutes=30)
+            start = end - timedelta(minutes=bars_1m_needed * 3)
 
             # Continuous front-month (e.g. MES.c.0)
             root = symbol[:3] if len(symbol) > 3 else symbol
@@ -113,21 +124,48 @@ class SignalHandler:
                 logger.info("warmup_no_data", symbol=symbol)
                 return
 
-            # Take last N bars
-            df = df.tail(bars)
+            # Resample 1m → target freq if needed
+            if freq_seconds > 60:
+                df_pl = pl.DataFrame({
+                    "timestamp": [idx.to_pydatetime() for idx in df.index],
+                    "open": df["open"].values,
+                    "high": df["high"].values,
+                    "low": df["low"].values,
+                    "close": df["close"].values,
+                    "volume": df["volume"].values,
+                })
+                from src.data.bars import resample_bars
+                df_pl = resample_bars(df_pl, freq=bar_freq)
+                # Take last N bars
+                df_pl = df_pl.tail(bars)
 
-            for _, row in df.iterrows():
-                bar = BarEvent(
-                    symbol=symbol,
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=int(row["volume"]),
-                    bar_type="1m",
-                    timestamp_ns=int(row.name.timestamp() * 1e9),
-                )
-                self._bar_window.append(bar)
+                for row in df_pl.iter_rows(named=True):
+                    bar = BarEvent(
+                        symbol=symbol,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=int(row["volume"]),
+                        bar_type=bar_freq,
+                        timestamp_ns=int(row["timestamp"].timestamp() * 1e9),
+                    )
+                    self._bar_window.append(bar)
+            else:
+                # 1m bars, no resample needed
+                df = df.tail(bars)
+                for _, row in df.iterrows():
+                    bar = BarEvent(
+                        symbol=symbol,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=int(row["volume"]),
+                        bar_type=bar_freq,
+                        timestamp_ns=int(row.name.timestamp() * 1e9),
+                    )
+                    self._bar_window.append(bar)
 
             # Trim to max window
             if len(self._bar_window) > 500:
@@ -136,8 +174,8 @@ class SignalHandler:
             # Run signal engine once on the full window to warm up all signals
             self._signal_engine.compute(self._bar_window)
 
-            logger.info("warmup_complete", bars_loaded=len(df),
-                         window_size=len(self._bar_window))
+            logger.info("warmup_complete", bars_loaded=len(self._bar_window),
+                         window_size=len(self._bar_window), bar_freq=bar_freq)
 
         except Exception as e:
             logger.warning("warmup_databento_error", error=str(e))
