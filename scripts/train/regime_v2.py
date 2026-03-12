@@ -243,6 +243,10 @@ def main():
     parser.add_argument("--emission", default="gaussian",
                         choices=["gaussian", "studentt"],
                         help="Emission distribution type (default: gaussian)")
+    parser.add_argument("--feature-tier", default="t2", choices=["t1", "t2"],
+                        help="Feature tier: t1 (4 features) or t2 (7 features, default)")
+    parser.add_argument("--no-pca", action="store_true",
+                        help="Disable PCA decorrelation")
 
     args = parser.parse_args()
 
@@ -254,6 +258,8 @@ def main():
         hurst_window=args.hurst_window,
         autocorr_window=args.autocorr_window,
         emission_type=args.emission,
+        feature_tier=args.feature_tier,
+        pca_enabled=not args.no_pca,
     )
 
     print(f"Config: {config}")

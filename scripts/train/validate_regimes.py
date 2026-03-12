@@ -339,9 +339,13 @@ def main():
     parser.add_argument("--dof", type=int, default=5)
     parser.add_argument("--hurst-window", type=int, default=250)
     parser.add_argument("--autocorr-window", type=int, default=100)
-    parser.add_argument("--emission", default="studentt",
+    parser.add_argument("--emission", default="gaussian",
                         choices=["studentt", "gaussian"],
                         help="Emission distribution type")
+    parser.add_argument("--feature-tier", default="t2", choices=["t1", "t2"],
+                        help="Feature tier: t1 (4 features) or t2 (7 features, default)")
+    parser.add_argument("--no-pca", action="store_true",
+                        help="Disable PCA decorrelation")
     args = parser.parse_args()
 
     config = RegimeDetectorV2Config(
@@ -352,6 +356,8 @@ def main():
         hurst_window=args.hurst_window,
         autocorr_window=args.autocorr_window,
         emission_type=args.emission,
+        feature_tier=args.feature_tier,
+        pca_enabled=not args.no_pca,
     )
 
     df = load_5m_bars(args.parquet_dir, args.start, args.end)

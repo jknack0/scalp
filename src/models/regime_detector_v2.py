@@ -1,23 +1,21 @@
 """Phase 7: Production Regime Detector V2 — 3-state HMM, forward-only.
 
-Step 3 upgrade: Transition Layer (BOCPD + CUSUM + Vol Z-Score)
-- 3 independent changepoint detectors run in parallel with HMM
-- BOCPD: Bayesian Online Changepoint Detection (truncated run-length, hazard lambda)
-- CUSUM: Two-sided cumulative sum mean-shift detector
-- Vol z-score: GK volatility spike detector
-- 2-of-3 agreement required to confirm HMM regime transitions
-- Suppresses false transitions → fewer whipsaw halts, more stable regimes
+Step 4 upgrade: T2 Features + PCA Decorrelation
+- T2 features: ADX (trend strength), vol-of-vol, VPIN (informed trading)
+- PCA whitening: decorrelates features before HMM, retains 95%+ variance
+- Dynamic feature count: T1 (4 features) or T2 (7 features)
 
 Previous steps:
 - Step 1: 3-state GaussianHMM, 2 features, forward-only
 - Step 2: 4 features (+ Hurst DFA, autocorr), dual-backend (Gaussian default, Student-t optional)
+- Step 3: Transition layer (BOCPD + CUSUM + vol z-score, 2-of-3 agreement)
 - Anti-whipsaw: hysteresis, min bars in regime, flip halt
 - Position sizing from confidence thresholds
 
 Usage:
     # Training (offline)
     detector = RegimeDetectorV2(config)
-    detector.fit(features)             # (N, 4) matrix
+    detector.fit(features)             # (N, 7) matrix for T2
     detector.save("models/regime_v2")
 
     # Batch (backtest) — forward-only over full sequence
@@ -50,7 +48,8 @@ from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
 
-N_FEATURES = 4  # log_return, gk_vol, hurst_dfa, autocorr_sum
+N_FEATURES_T1 = 4  # log_return, gk_vol, hurst_dfa, autocorr_sum
+N_FEATURES_T2 = 7  # T1 + adx, vol_of_vol, vpin
 
 
 # ── Regime labels ────────────────────────────────────────────────────
@@ -106,12 +105,25 @@ class RegimeDetectorV2Config:
     # Student-t
     studentt_dof: int = 5        # Degrees of freedom (fixed, not learned by EM)
 
-    # Features
+    # Feature tier: "t1" = 4 features, "t2" = 7 features (+ ADX, vol-of-vol, VPIN)
+    feature_tier: str = "t2"
+
+    # Features (T1)
     gk_vol_window: int = 20          # Garman-Klass vol rolling window
     hurst_window: int = 250          # DFA rolling window (bars)
     hurst_stride: int = 5            # Compute DFA every N bars (batch), ffill between
     autocorr_window: int = 100       # Rolling window for autocorrelation
     autocorr_max_lag: int = 10       # Max lag for autocorrelation sum
+
+    # Features (T2)
+    adx_period: int = 14             # ADX smoothing period
+    vol_of_vol_window: int = 20      # Rolling std of GK vol window
+    vpin_bucket_size: int = 100      # VPIN volume per bucket
+    vpin_n_buckets: int = 50         # VPIN rolling bucket count
+
+    # PCA decorrelation
+    pca_enabled: bool = True         # Apply PCA whitening before HMM
+    pca_min_variance: float = 0.95   # Retain components explaining this fraction
 
     # Online normalization
     zscore_window: int = 500         # Rolling z-score window
@@ -284,6 +296,140 @@ def _rolling_autocorr_sum(
     return result
 
 
+def _rolling_adx(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """Rolling ADX (Average Directional Index) via Wilder smoothing.
+
+    Returns ADX values (0-100 scale) for each bar. First `period*2` bars are NaN.
+    """
+    n = len(close)
+    adx_out = np.full(n, np.nan)
+    if n < period * 2 + 1:
+        return adx_out
+
+    # True Range, +DM, -DM (starting from bar 1)
+    tr = np.empty(n - 1)
+    plus_dm = np.empty(n - 1)
+    minus_dm = np.empty(n - 1)
+    for i in range(1, n):
+        tr[i - 1] = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1]),
+        )
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+        plus_dm[i - 1] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm[i - 1] = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+    # Wilder smoothing
+    def _wilder(arr: np.ndarray, p: int) -> np.ndarray:
+        out = np.empty_like(arr)
+        out[0] = arr[0]
+        for i in range(1, len(arr)):
+            out[i] = out[i - 1] + (arr[i] - out[i - 1]) / p
+        return out
+
+    atr = _wilder(tr, period)
+    plus_di_s = _wilder(plus_dm, period)
+    minus_di_s = _wilder(minus_dm, period)
+
+    # DI values
+    safe_atr = np.where(atr < 1e-10, 1.0, atr)
+    plus_di = 100.0 * plus_di_s / safe_atr
+    minus_di = 100.0 * minus_di_s / safe_atr
+
+    # DX
+    di_sum = plus_di + minus_di
+    di_diff = np.abs(plus_di - minus_di)
+    safe_sum = np.where(di_sum < 1e-10, 1.0, di_sum)
+    dx = 100.0 * di_diff / safe_sum
+
+    # ADX = Wilder smooth of DX
+    adx_raw = _wilder(dx, period)
+
+    # Map back: adx_raw[i] corresponds to bar i+1 (since TR starts at bar 1)
+    adx_out[1:] = adx_raw
+    return adx_out
+
+
+def _rolling_vol_of_vol(gk_vol: np.ndarray, window: int = 20) -> np.ndarray:
+    """Rolling standard deviation of GK volatility (vol-of-vol)."""
+    series = pl.Series("v", gk_vol)
+    result = series.rolling_std(window_size=window, min_samples=2).to_numpy()
+    return result
+
+
+def _rolling_vpin(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    volume: np.ndarray,
+    bucket_size: int = 100,
+    n_buckets: int = 50,
+) -> np.ndarray:
+    """Rolling VPIN (Volume-Synchronized Probability of Informed Trading).
+
+    Uses BVC (Bulk Volume Classification) approximation.
+    Returns VPIN value (0-1) per bar based on trailing bucket window.
+    """
+    n = len(close)
+    vpin_out = np.full(n, np.nan)
+
+    bucket_imbalances: deque[float] = deque(maxlen=n_buckets)
+    bucket_buy = 0.0
+    bucket_sell = 0.0
+    bucket_remaining = float(bucket_size)
+
+    for i in range(n):
+        vol = float(volume[i])
+        if vol <= 0:
+            if len(bucket_imbalances) > 0:
+                vpin_out[i] = float(np.mean(list(bucket_imbalances)))
+            continue
+
+        # BVC classification
+        hl_range = high[i] - low[i]
+        buy_pct = (close[i] - low[i]) / hl_range if hl_range > 1e-10 else 0.5
+        bar_buy = vol * buy_pct
+        bar_sell = vol - bar_buy
+
+        remaining_buy = bar_buy
+        remaining_sell = bar_sell
+        remaining_vol = vol
+
+        while remaining_vol > 1e-9:
+            fill = min(remaining_vol, bucket_remaining)
+            if remaining_vol > 0:
+                proportion = fill / remaining_vol
+            else:
+                break
+
+            bucket_buy += remaining_buy * proportion
+            bucket_sell += remaining_sell * proportion
+            remaining_buy -= remaining_buy * proportion
+            remaining_sell -= remaining_sell * proportion
+            remaining_vol -= fill
+            bucket_remaining -= fill
+
+            if bucket_remaining < 1e-9:
+                imbalance = abs(bucket_buy - bucket_sell) / bucket_size
+                bucket_imbalances.append(imbalance)
+                bucket_buy = 0.0
+                bucket_sell = 0.0
+                bucket_remaining = float(bucket_size)
+
+        if len(bucket_imbalances) > 0:
+            vpin_out[i] = float(np.mean(list(bucket_imbalances)))
+
+    return vpin_out
+
+
 def _rolling_zscore(raw: np.ndarray, window: int) -> np.ndarray:
     """Rolling z-score normalization, clipped to [-3, 3]."""
     n, k = raw.shape
@@ -303,16 +449,17 @@ def build_features_v2(
     df: pl.DataFrame,
     config: RegimeDetectorV2Config | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build the 4-feature matrix for V2 regime detector.
+    """Build the feature matrix for V2 regime detector.
 
-    Features: [log_return, garman_klass_vol, hurst_dfa, autocorr_sum]
+    T1 (4 features): [log_return, garman_klass_vol, hurst_dfa, autocorr_sum]
+    T2 (7 features): T1 + [adx, vol_of_vol, vpin]
 
     Args:
         df: Bar DataFrame with columns: timestamp, open, high, low, close, volume
-        config: Detector config (for window sizes)
+        config: Detector config (for window sizes and feature tier)
 
     Returns:
-        (features, timestamps) — features is (N, 4), timestamps is (N,) int64 ns.
+        (features, timestamps) — features is (N, n_features), timestamps is (N,) int64 ns.
         Warm-up rows dropped.
     """
     cfg = config or RegimeDetectorV2Config()
@@ -321,6 +468,7 @@ def build_features_v2(
     open_ = df["open"].to_numpy().astype(np.float64)
     high = df["high"].to_numpy().astype(np.float64)
     low = df["low"].to_numpy().astype(np.float64)
+    volume = df["volume"].to_numpy().astype(np.float64)
     n = len(close)
 
     # Timestamps
@@ -349,8 +497,29 @@ def build_features_v2(
         log_ret, window=cfg.autocorr_window, max_lag=cfg.autocorr_max_lag
     )
 
-    # Stack raw features (N, 4)
-    raw = np.column_stack([log_ret, gk_vol, hurst, autocorr])
+    columns = [log_ret, gk_vol, hurst, autocorr]
+
+    # T2 features
+    if cfg.feature_tier == "t2":
+        # Feature 5: ADX (trend strength)
+        adx = _rolling_adx(open_, high, low, close, period=cfg.adx_period)
+        # Scale ADX from 0-100 to roughly 0-1 before z-scoring
+        adx_scaled = adx / 100.0
+
+        # Feature 6: Vol-of-vol (rolling std of GK vol)
+        vov = _rolling_vol_of_vol(gk_vol, window=cfg.vol_of_vol_window)
+
+        # Feature 7: VPIN
+        vpin = _rolling_vpin(
+            close, high, low, volume,
+            bucket_size=cfg.vpin_bucket_size,
+            n_buckets=cfg.vpin_n_buckets,
+        )
+
+        columns.extend([adx_scaled, vov, vpin])
+
+    # Stack raw features (N, n_features)
+    raw = np.column_stack(columns)
 
     # Rolling z-score normalization
     normed = _rolling_zscore(raw, window=cfg.zscore_window)
@@ -697,20 +866,25 @@ class TransitionLayer:
 # ── Detector class ───────────────────────────────────────────────────
 
 class RegimeDetectorV2:
-    """Phase 7 production regime detector — 3-state Student-t HMM, forward-only.
+    """Phase 7 production regime detector — 3-state HMM, forward-only.
 
-    Step 2 upgrade:
-    - pomegranate DenseHMM with StudentT emissions (heavy tails)
-    - 4 features: log_return, gk_vol, hurst_dfa, autocorr_sum
-    - Forward-only inference: predict_proba() never Viterbi
-    - Anti-whipsaw: hysteresis, min bars, flip halt
-    - Position sizing from confidence thresholds
+    Step 4 upgrade:
+    - T2 features: ADX, vol-of-vol, VPIN (7 total)
+    - PCA decorrelation before HMM (removes cross-feature correlations)
+    - Dynamic feature count based on tier config
+    - Dual-backend: hmmlearn Gaussian (default) or pomegranate Student-t
+    - Forward-only inference, anti-whipsaw, transition layer
     """
 
     def __init__(self, config: RegimeDetectorV2Config | None = None) -> None:
         self.config = config or RegimeDetectorV2Config()
         self.model: DenseHMM | None = None
         self.state_map: dict[int, RegimeLabel] | None = None
+        self._pca_components: np.ndarray | None = None  # (n_kept, n_features)
+        self._pca_mean: np.ndarray | None = None         # (n_features,)
+        self._n_features: int = (
+            N_FEATURES_T2 if self.config.feature_tier == "t2" else N_FEATURES_T1
+        )
         self._lock = threading.Lock()
         self._reset_online_state()
 
@@ -730,6 +904,25 @@ class RegimeDetectorV2:
             maxlen=max(cfg.hurst_window, cfg.autocorr_window)
         )
 
+        # T2: ADX online state
+        self._adx_highs: deque[float] = deque(maxlen=cfg.adx_period * 3)
+        self._adx_lows: deque[float] = deque(maxlen=cfg.adx_period * 3)
+        self._adx_closes: deque[float] = deque(maxlen=cfg.adx_period * 3)
+        self._adx_atr: float = 0.0
+        self._adx_plus_di_s: float = 0.0
+        self._adx_minus_di_s: float = 0.0
+        self._adx_value: float = 0.0
+        self._adx_warmup: int = 0
+
+        # T2: Vol-of-vol online state
+        self._gk_vol_buffer: deque[float] = deque(maxlen=cfg.vol_of_vol_window)
+
+        # T2: VPIN online state
+        self._vpin_bucket_imbalances: deque[float] = deque(maxlen=cfg.vpin_n_buckets)
+        self._vpin_bucket_buy: float = 0.0
+        self._vpin_bucket_sell: float = 0.0
+        self._vpin_bucket_remaining: float = float(cfg.vpin_bucket_size)
+
         # Anti-whipsaw state
         self._current_regime: RegimeLabel = RegimeLabel.RANGING
         self._bars_in_regime: int = 0
@@ -748,17 +941,31 @@ class RegimeDetectorV2:
     # ── Training ─────────────────────────────────────────────────────
 
     def fit(self, features: np.ndarray) -> None:
-        """Fit 3-state HMM on (N, 4) feature matrix.
+        """Fit 3-state HMM on (N, n_features) feature matrix.
 
-        Uses KMeans initialization for stable convergence.
-        Supports both pomegranate StudentT and hmmlearn Gaussian backends.
+        Steps:
+        1. Optional PCA decorrelation (retain pca_min_variance of explained variance)
+        2. KMeans initialization for stable convergence
+        3. Fit HMM (Gaussian or Student-t backend)
+        4. Label states via Hungarian algorithm
         """
         cfg = self.config
-        n_features = features.shape[1]
+        self._n_features = features.shape[1]
 
         # Reproducibility
         torch.manual_seed(cfg.random_state)
         np.random.seed(cfg.random_state)
+
+        # PCA decorrelation (fit and transform)
+        if cfg.pca_enabled:
+            features = self._fit_pca(features, cfg.pca_min_variance)
+            logger.info(
+                "PCA: %d -> %d components (%.1f%% variance retained)",
+                self._n_features, features.shape[1],
+                cfg.pca_min_variance * 100,
+            )
+
+        n_features_post = features.shape[1]
 
         # KMeans seeding for emission means
         km = KMeans(
@@ -767,18 +974,44 @@ class RegimeDetectorV2:
             n_init=10,
         )
         km.fit(features)
-        centers = km.cluster_centers_  # (n_states, n_features)
+        centers = km.cluster_centers_  # (n_states, n_features_post)
 
         if cfg.emission_type == "gaussian":
             self._fit_gaussian(features, centers, cfg)
         else:
-            self._fit_studentt(features, centers, cfg, n_features)
+            self._fit_studentt(features, centers, cfg, n_features_post)
 
         self._label_states()
         logger.info(
-            "RegimeDetectorV2 fitted (%s): %d states, %d features, %d samples",
-            cfg.emission_type, cfg.n_states, n_features, len(features),
+            "RegimeDetectorV2 fitted (%s): %d states, %d raw features "
+            "-> %d HMM dims, %d samples",
+            cfg.emission_type, cfg.n_states, self._n_features,
+            n_features_post, len(features),
         )
+
+    def _fit_pca(self, features: np.ndarray, min_variance: float) -> np.ndarray:
+        """Fit PCA on features and transform. Stores components for inference."""
+        self._pca_mean = features.mean(axis=0)
+        centered = features - self._pca_mean
+
+        # SVD (more numerically stable than eigendecomposition)
+        _, s, vt = np.linalg.svd(centered, full_matrices=False)
+        explained_var = s ** 2 / (len(features) - 1)
+        cumulative = np.cumsum(explained_var) / explained_var.sum()
+
+        # Keep enough components for min_variance
+        n_keep = int(np.searchsorted(cumulative, min_variance) + 1)
+        n_keep = min(n_keep, len(s))  # Can't keep more than we have
+
+        self._pca_components = vt[:n_keep]  # (n_keep, n_features)
+        return centered @ self._pca_components.T
+
+    def _apply_pca(self, features: np.ndarray) -> np.ndarray:
+        """Apply pre-fitted PCA transform."""
+        if self._pca_components is None or self._pca_mean is None:
+            return features
+        centered = features - self._pca_mean
+        return centered @ self._pca_components.T
 
     def _fit_studentt(
         self, features: np.ndarray, centers: np.ndarray,
@@ -820,10 +1053,15 @@ class RegimeDetectorV2:
     def _label_states(self) -> None:
         """Map HMM components to semantic RegimeLabel via Hungarian algorithm.
 
-        Heuristic for 4 features [log_return, gk_vol, hurst, autocorr]:
-        - TRENDING:  high Hurst (persistence), positive autocorr, moderate vol
-        - RANGING:   low vol, near-zero return, low Hurst
-        - HIGH_VOL:  high vol, high return variance
+        If PCA is active, emission means are projected back to original feature
+        space for interpretable labeling.
+
+        Heuristic (original feature indices):
+        - [0] log_return, [1] gk_vol, [2] hurst, [3] autocorr
+        - T2 adds: [4] adx, [5] vol_of_vol, [6] vpin
+        - TRENDING:  high Hurst, positive autocorr, high ADX, moderate vol
+        - RANGING:   low vol, near-zero return, low Hurst, low ADX
+        - HIGH_VOL:  high vol, high return variance, high vol-of-vol
         """
         assert self.model is not None
         n_states = self.config.n_states
@@ -832,37 +1070,48 @@ class RegimeDetectorV2:
 
         for s in range(n_states):
             if is_gaussian:
-                means = self.model.means_[s]
+                raw_means = self.model.means_[s]
                 covars = self.model.covars_
                 if self.model.covariance_type == "full":
-                    lr_var = covars[s][0, 0]
+                    lr_var_pca = covars[s][0, 0]
                 elif self.model.covariance_type == "diag":
-                    lr_var = covars[s][0]
+                    lr_var_pca = covars[s][0]
                 else:
-                    lr_var = float(covars[s])
+                    lr_var_pca = float(covars[s])
             else:
                 dist = self.model.distributions[s]
-                means = dist.means.data.numpy().flatten()
+                raw_means = dist.means.data.numpy().flatten()
                 covs_raw = dist.covs.data.numpy()
-                lr_var = covs_raw[0] if covs_raw.ndim == 1 else float(covs_raw.flat[0])
+                lr_var_pca = covs_raw[0] if covs_raw.ndim == 1 else float(covs_raw.flat[0])
+
+            # Project back to original feature space if PCA active
+            if self._pca_components is not None and self._pca_mean is not None:
+                means = raw_means @ self._pca_components + self._pca_mean
+            else:
+                means = np.asarray(raw_means)
 
             lr_mean = means[0]
             gk_mean = means[1]
             hurst_mean = means[2] if len(means) > 2 else 0.0
             ac_mean = means[3] if len(means) > 3 else 0.0
+            adx_mean = means[4] if len(means) > 4 else 0.0
+            vov_mean = means[5] if len(means) > 5 else 0.0
 
-            # TRENDING: directional, persistent, moderate vol
+            # TRENDING: directional, persistent, high trend strength
             cost[s, RegimeLabel.TRENDING] = -(
-                abs(lr_mean) + 0.5 * hurst_mean + 0.3 * ac_mean - 0.2 * gk_mean
+                abs(lr_mean) + 0.5 * hurst_mean + 0.3 * ac_mean
+                - 0.2 * gk_mean + 0.4 * adx_mean
             )
 
-            # RANGING: low vol, near-zero return, low persistence
+            # RANGING: low vol, near-zero return, low persistence, low ADX
             cost[s, RegimeLabel.RANGING] = -(
-                -gk_mean - abs(lr_mean) - 0.3 * hurst_mean
+                -gk_mean - abs(lr_mean) - 0.3 * hurst_mean - 0.3 * adx_mean
             )
 
-            # HIGH_VOL: high vol, high return variance
-            cost[s, RegimeLabel.HIGH_VOL] = -(gk_mean + lr_var)
+            # HIGH_VOL: high vol, high return variance, high vol-of-vol
+            cost[s, RegimeLabel.HIGH_VOL] = -(
+                gk_mean + lr_var_pca + 0.3 * vov_mean
+            )
 
         row_ind, col_ind = linear_sum_assignment(cost)
         self.state_map = {
@@ -883,6 +1132,11 @@ class RegimeDetectorV2:
         assert self.model is not None and self.state_map is not None
 
         cfg = self.config
+
+        # Apply PCA if fitted
+        if cfg.pca_enabled and self._pca_components is not None:
+            features = self._apply_pca(features)
+
         n = len(features)
 
         # Get posteriors from the appropriate backend
@@ -1038,6 +1292,10 @@ class RegimeDetectorV2:
 
             window = np.array(self._zscored_window)
 
+            # Apply PCA if fitted
+            if self.config.pca_enabled and self._pca_components is not None:
+                window = self._apply_pca(window)
+
             # Forward algorithm over sliding window
             if self.config.emission_type == "gaussian":
                 proba_matrix = self.model.predict_proba(window)
@@ -1124,11 +1382,16 @@ class RegimeDetectorV2:
             return proba
 
     def _compute_online_features(self, bar: dict) -> np.ndarray | None:
-        """Compute raw [log_return, gk_vol, hurst, autocorr] from a single bar."""
+        """Compute raw features from a single bar.
+
+        T1: [log_return, gk_vol, hurst, autocorr]
+        T2: T1 + [adx, vol_of_vol, vpin]
+        """
         close = float(bar["close"])
         open_ = float(bar["open"])
         high = float(bar["high"])
         low = float(bar["low"])
+        volume = float(bar.get("volume", 0))
 
         # Log return
         if self._prev_close is not None:
@@ -1166,7 +1429,127 @@ class RegimeDetectorV2:
             returns_arr[-cfg.autocorr_window :], max_lag=cfg.autocorr_max_lag
         )
 
-        return np.array([lr, gk_vol, hurst, autocorr], dtype=np.float64)
+        feats = [lr, gk_vol, hurst, autocorr]
+
+        # T2 features
+        if cfg.feature_tier == "t2":
+            # ADX (online Wilder smoothing)
+            self._adx_highs.append(high)
+            self._adx_lows.append(low)
+            self._adx_closes.append(close)
+            adx_val = self._compute_online_adx(high, low, close, cfg.adx_period)
+            adx_scaled = adx_val / 100.0
+
+            # Vol-of-vol
+            self._gk_vol_buffer.append(gk_vol)
+            if len(self._gk_vol_buffer) >= 2:
+                vov = float(np.std(list(self._gk_vol_buffer), ddof=1))
+            else:
+                vov = 0.0
+
+            # VPIN (online bucket fill)
+            vpin_val = self._compute_online_vpin(close, high, low, volume, cfg)
+
+            feats.extend([adx_scaled, vov, vpin_val])
+
+        return np.array(feats, dtype=np.float64)
+
+    def _compute_online_adx(
+        self, high: float, low: float, close: float, period: int
+    ) -> float:
+        """Online ADX computation with Wilder smoothing."""
+        self._adx_warmup += 1
+        if self._adx_warmup < 2:
+            return 0.0
+
+        highs = self._adx_highs
+        lows = self._adx_lows
+        closes = self._adx_closes
+
+        if len(closes) < 2:
+            return 0.0
+
+        # Current bar TR, +DM, -DM
+        prev_close = closes[-2]
+        prev_high = highs[-2]
+        prev_low = lows[-2]
+
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        # Wilder smoothing (online)
+        alpha = 1.0 / period
+        if self._adx_warmup == 2:
+            self._adx_atr = tr
+            self._adx_plus_di_s = plus_dm
+            self._adx_minus_di_s = minus_dm
+            self._adx_value = 0.0
+        else:
+            self._adx_atr += alpha * (tr - self._adx_atr)
+            self._adx_plus_di_s += alpha * (plus_dm - self._adx_plus_di_s)
+            self._adx_minus_di_s += alpha * (minus_dm - self._adx_minus_di_s)
+
+        safe_atr = max(self._adx_atr, 1e-10)
+        plus_di = 100.0 * self._adx_plus_di_s / safe_atr
+        minus_di = 100.0 * self._adx_minus_di_s / safe_atr
+
+        di_sum = plus_di + minus_di
+        if di_sum < 1e-10:
+            dx = 0.0
+        else:
+            dx = 100.0 * abs(plus_di - minus_di) / di_sum
+
+        self._adx_value += alpha * (dx - self._adx_value)
+        return self._adx_value
+
+    def _compute_online_vpin(
+        self, close: float, high: float, low: float,
+        volume: float, cfg: RegimeDetectorV2Config,
+    ) -> float:
+        """Online VPIN computation using BVC bucket filling."""
+        if volume <= 0:
+            if len(self._vpin_bucket_imbalances) > 0:
+                return float(np.mean(list(self._vpin_bucket_imbalances)))
+            return 0.0
+
+        hl_range = high - low
+        buy_pct = (close - low) / hl_range if hl_range > 1e-10 else 0.5
+        bar_buy = volume * buy_pct
+        bar_sell = volume - bar_buy
+
+        remaining_buy = bar_buy
+        remaining_sell = bar_sell
+        remaining_vol = volume
+
+        while remaining_vol > 1e-9:
+            fill = min(remaining_vol, self._vpin_bucket_remaining)
+            if remaining_vol > 0:
+                proportion = fill / remaining_vol
+            else:
+                break
+
+            self._vpin_bucket_buy += remaining_buy * proportion
+            self._vpin_bucket_sell += remaining_sell * proportion
+            remaining_buy -= remaining_buy * proportion
+            remaining_sell -= remaining_sell * proportion
+            remaining_vol -= fill
+            self._vpin_bucket_remaining -= fill
+
+            if self._vpin_bucket_remaining < 1e-9:
+                imbalance = abs(
+                    self._vpin_bucket_buy - self._vpin_bucket_sell
+                ) / cfg.vpin_bucket_size
+                self._vpin_bucket_imbalances.append(imbalance)
+                self._vpin_bucket_buy = 0.0
+                self._vpin_bucket_sell = 0.0
+                self._vpin_bucket_remaining = float(cfg.vpin_bucket_size)
+
+        if len(self._vpin_bucket_imbalances) > 0:
+            return float(np.mean(list(self._vpin_bucket_imbalances)))
+        return 0.0
 
     def _zscore_and_clip(self, raw: np.ndarray) -> np.ndarray | None:
         """Z-score against rolling history, clip to [-3, 3]."""
@@ -1213,8 +1596,10 @@ class RegimeDetectorV2:
                     "model": self.model,
                     "state_map": self.state_map,
                     "config": self.config,
-                    "version": 3,
-                    "n_features": N_FEATURES,
+                    "version": 4,
+                    "n_features": self._n_features,
+                    "pca_components": self._pca_components,
+                    "pca_mean": self._pca_mean,
                 },
                 path / "regime_v2.joblib",
             )
@@ -1225,8 +1610,10 @@ class RegimeDetectorV2:
                 {
                     "state_map": self.state_map,
                     "config": self.config,
-                    "version": 3,
-                    "n_features": N_FEATURES,
+                    "version": 4,
+                    "n_features": self._n_features,
+                    "pca_components": self._pca_components,
+                    "pca_mean": self._pca_mean,
                 },
                 path / "regime_v2.joblib",
             )
@@ -1239,6 +1626,9 @@ class RegimeDetectorV2:
         data = joblib.load(path / "regime_v2.joblib")
         obj = cls(config=data["config"])
         obj.state_map = data["state_map"]
+        obj._n_features = data.get("n_features", N_FEATURES_T1)
+        obj._pca_components = data.get("pca_components")
+        obj._pca_mean = data.get("pca_mean")
 
         if data["config"].emission_type == "gaussian":
             obj.model = data["model"]

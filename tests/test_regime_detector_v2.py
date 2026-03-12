@@ -1,4 +1,4 @@
-"""Tests for Phase 7 Regime Detector V2 (Step 3: Transition Layer)."""
+"""Tests for Phase 7 Regime Detector V2 (Step 4: T2 Features + PCA)."""
 
 import numpy as np
 import polars as pl
@@ -8,7 +8,8 @@ from pathlib import Path
 from src.models.regime_detector_v2 import (
     BOCPDDetector,
     CUSUMDetector,
-    N_FEATURES,
+    N_FEATURES_T1,
+    N_FEATURES_T2,
     RegimeDetectorV2,
     RegimeDetectorV2Config,
     RegimeLabel,
@@ -17,6 +18,9 @@ from src.models.regime_detector_v2 import (
     VolZScoreDetector,
     _autocorr_sum_single,
     _dfa_hurst_single,
+    _rolling_adx,
+    _rolling_vol_of_vol,
+    _rolling_vpin,
     build_features_v2,
     compute_regime_stats,
 )
@@ -72,6 +76,7 @@ def bar_df():
 
 @pytest.fixture
 def config():
+    """T1 config (4 features, no PCA) — backward compat for existing tests."""
     return RegimeDetectorV2Config(
         zscore_window=100,
         warmup_bars=80,
@@ -83,6 +88,32 @@ def config():
         autocorr_max_lag=5,
         studentt_dof=5,
         covariance_type="diag",  # faster for tests
+        feature_tier="t1",
+        pca_enabled=False,
+    )
+
+
+@pytest.fixture
+def config_t2():
+    """T2 config (7 features + PCA)."""
+    return RegimeDetectorV2Config(
+        zscore_window=100,
+        warmup_bars=80,
+        predict_window=50,
+        gk_vol_window=10,
+        hurst_window=80,
+        hurst_stride=5,
+        autocorr_window=50,
+        autocorr_max_lag=5,
+        studentt_dof=5,
+        covariance_type="diag",
+        feature_tier="t2",
+        pca_enabled=True,
+        pca_min_variance=0.95,
+        adx_period=14,
+        vol_of_vol_window=10,
+        vpin_bucket_size=50,
+        vpin_n_buckets=20,
     )
 
 
@@ -90,6 +121,14 @@ def config():
 def fitted_detector(bar_df, config):
     features, _ = build_features_v2(bar_df, config)
     detector = RegimeDetectorV2(config)
+    detector.fit(features)
+    return detector, features
+
+
+@pytest.fixture
+def fitted_detector_t2(bar_df, config_t2):
+    features, _ = build_features_v2(bar_df, config_t2)
+    detector = RegimeDetectorV2(config_t2)
     detector.fit(features)
     return detector, features
 
@@ -140,7 +179,7 @@ class TestBuildFeatures:
     def test_shape_4_features(self, bar_df, config):
         features, timestamps = build_features_v2(bar_df, config)
         assert features.ndim == 2
-        assert features.shape[1] == N_FEATURES  # 4 features
+        assert features.shape[1] == N_FEATURES_T1  # 4 features
         assert len(timestamps) == len(features)
 
     def test_no_nans(self, bar_df, config):
@@ -595,3 +634,222 @@ class TestProtocol:
         detector, _ = fitted_detector
         result = detector.current_regime()
         assert result in ("trending", "ranging", "high_vol")
+
+
+# ── T2 Feature Extractors ──────────────────────────────────────────
+
+class TestRollingADX:
+    def test_output_shape(self, bar_df):
+        close = bar_df["close"].to_numpy().astype(np.float64)
+        open_ = bar_df["open"].to_numpy().astype(np.float64)
+        high = bar_df["high"].to_numpy().astype(np.float64)
+        low = bar_df["low"].to_numpy().astype(np.float64)
+        adx = _rolling_adx(open_, high, low, close, period=14)
+        assert len(adx) == len(close)
+
+    def test_adx_range(self, bar_df):
+        close = bar_df["close"].to_numpy().astype(np.float64)
+        open_ = bar_df["open"].to_numpy().astype(np.float64)
+        high = bar_df["high"].to_numpy().astype(np.float64)
+        low = bar_df["low"].to_numpy().astype(np.float64)
+        adx = _rolling_adx(open_, high, low, close, period=14)
+        valid = adx[~np.isnan(adx)]
+        assert valid.min() >= 0
+        assert valid.max() <= 100
+
+    def test_trending_higher_adx(self):
+        """Trending data should produce higher ADX than flat data."""
+        n = 500
+        # Trending: steady upward
+        prices_trend = 5000 + np.cumsum(np.full(n, 0.5))
+        noise = np.random.default_rng(42).uniform(0.5, 2.0, n)
+        h_t = prices_trend + noise
+        l_t = prices_trend - noise
+        o_t = prices_trend - noise / 2
+        adx_trend = _rolling_adx(o_t, h_t, l_t, prices_trend, period=14)
+
+        # Flat: oscillating
+        prices_flat = 5000 + np.sin(np.arange(n) * 0.3) * 2
+        h_f = prices_flat + noise
+        l_f = prices_flat - noise
+        o_f = prices_flat - noise / 2
+        adx_flat = _rolling_adx(o_f, h_f, l_f, prices_flat, period=14)
+
+        # Last 100 bars: trending should have higher ADX
+        assert np.nanmean(adx_trend[-100:]) > np.nanmean(adx_flat[-100:])
+
+
+class TestRollingVolOfVol:
+    def test_output_shape(self, bar_df):
+        gk_vol = np.random.default_rng(42).uniform(0.005, 0.01, len(bar_df))
+        vov = _rolling_vol_of_vol(gk_vol, window=20)
+        assert len(vov) == len(gk_vol)
+
+    def test_constant_vol_zero_vov(self):
+        gk_vol = np.full(100, 0.005)
+        vov = _rolling_vol_of_vol(gk_vol, window=20)
+        # Constant vol -> vol-of-vol should be ~0
+        assert vov[-1] < 1e-10
+
+    def test_volatile_vol_higher_vov(self):
+        rng = np.random.default_rng(42)
+        stable = np.full(100, 0.005)
+        volatile = rng.uniform(0.001, 0.02, size=100)
+        vov_stable = _rolling_vol_of_vol(stable, window=20)
+        vov_volatile = _rolling_vol_of_vol(volatile, window=20)
+        assert vov_volatile[-1] > vov_stable[-1]
+
+
+class TestRollingVPIN:
+    def test_output_shape(self, bar_df):
+        close = bar_df["close"].to_numpy().astype(np.float64)
+        high = bar_df["high"].to_numpy().astype(np.float64)
+        low = bar_df["low"].to_numpy().astype(np.float64)
+        volume = bar_df["volume"].to_numpy().astype(np.float64)
+        vpin = _rolling_vpin(close, high, low, volume, bucket_size=50, n_buckets=20)
+        assert len(vpin) == len(close)
+
+    def test_vpin_range(self, bar_df):
+        close = bar_df["close"].to_numpy().astype(np.float64)
+        high = bar_df["high"].to_numpy().astype(np.float64)
+        low = bar_df["low"].to_numpy().astype(np.float64)
+        volume = bar_df["volume"].to_numpy().astype(np.float64)
+        vpin = _rolling_vpin(close, high, low, volume, bucket_size=50, n_buckets=20)
+        valid = vpin[~np.isnan(vpin)]
+        assert valid.min() >= 0.0
+        assert valid.max() <= 1.0
+
+
+# ── T2 Feature Build ───────────────────────────────────────────────
+
+class TestBuildFeaturesT2:
+    def test_shape_7_features(self, bar_df, config_t2):
+        features, timestamps = build_features_v2(bar_df, config_t2)
+        assert features.ndim == 2
+        assert features.shape[1] == N_FEATURES_T2  # 7 features
+        assert len(timestamps) == len(features)
+
+    def test_no_nans(self, bar_df, config_t2):
+        features, _ = build_features_v2(bar_df, config_t2)
+        assert not np.any(np.isnan(features))
+        assert not np.any(np.isinf(features))
+
+    def test_zscore_clipped(self, bar_df, config_t2):
+        features, _ = build_features_v2(bar_df, config_t2)
+        assert features.min() >= -3.0
+        assert features.max() <= 3.0
+
+
+# ── PCA Decorrelation ──────────────────────────────────────────────
+
+class TestPCA:
+    def test_pca_reduces_dimensions(self, bar_df, config_t2):
+        features, _ = build_features_v2(bar_df, config_t2)
+        detector = RegimeDetectorV2(config_t2)
+        detector.fit(features)
+        assert detector._pca_components is not None
+        assert detector._pca_mean is not None
+        # Should keep <= n_features components
+        n_kept = detector._pca_components.shape[0]
+        assert 1 <= n_kept <= N_FEATURES_T2
+
+    def test_pca_disabled(self, bar_df):
+        cfg = RegimeDetectorV2Config(
+            zscore_window=100, warmup_bars=80, predict_window=50,
+            gk_vol_window=10, hurst_window=80, hurst_stride=5,
+            autocorr_window=50, autocorr_max_lag=5,
+            feature_tier="t2", pca_enabled=False,
+        )
+        features, _ = build_features_v2(bar_df, cfg)
+        detector = RegimeDetectorV2(cfg)
+        detector.fit(features)
+        assert detector._pca_components is None
+
+    def test_pca_transform_invertible(self, bar_df, config_t2):
+        """PCA transform + inverse should approximate identity."""
+        features, _ = build_features_v2(bar_df, config_t2)
+        detector = RegimeDetectorV2(config_t2)
+        detector._fit_pca(features, config_t2.pca_min_variance)
+
+        transformed = detector._apply_pca(features)
+        # Reconstruct: transformed @ components + mean
+        reconstructed = transformed @ detector._pca_components + detector._pca_mean
+        # Should be close (not exact if dimensions reduced)
+        error = np.mean((features - reconstructed) ** 2)
+        assert error < 0.1, f"PCA reconstruction error too high: {error}"
+
+
+# ── T2 Training & Prediction ──────────────────────────────────────
+
+class TestT2Training:
+    def test_fit_creates_model(self, fitted_detector_t2):
+        detector, _ = fitted_detector_t2
+        assert detector.model is not None
+        assert detector.state_map is not None
+        assert len(detector.state_map) == 3
+        assert detector._pca_components is not None
+
+    def test_predict_proba_sequence(self, fitted_detector_t2):
+        detector, features = fitted_detector_t2
+        probas = detector.predict_proba_sequence(features)
+        assert len(probas) == len(features)
+        for p in probas:
+            assert isinstance(p, RegimeProba)
+            assert abs(sum(p.probabilities) - 1.0) < 1e-3
+
+    def test_save_load_roundtrip_t2(self, fitted_detector_t2, tmp_path):
+        detector, features = fitted_detector_t2
+        save_dir = tmp_path / "regime_v2_t2"
+        detector.save(save_dir)
+        loaded = RegimeDetectorV2.load(save_dir)
+
+        assert loaded._pca_components is not None
+        assert loaded._pca_mean is not None
+        assert loaded._n_features == N_FEATURES_T2
+        np.testing.assert_array_almost_equal(
+            loaded._pca_components, detector._pca_components
+        )
+
+        # Predictions should match
+        orig = detector.predict_proba_sequence(features[:50])
+        loaded_p = loaded.predict_proba_sequence(features[:50])
+        for o, l in zip(orig, loaded_p):
+            for op, lp in zip(o.probabilities, l.probabilities):
+                assert abs(op - lp) < 1e-4
+
+
+# ── T2 Online Prediction ──────────────────────────────────────────
+
+class TestT2OnlinePrediction:
+    def test_online_t2_produces_output(self, bar_df):
+        cfg = RegimeDetectorV2Config(
+            zscore_window=30, warmup_bars=20, predict_window=20,
+            gk_vol_window=10, hurst_window=20, hurst_stride=1,
+            autocorr_window=15, autocorr_max_lag=3,
+            feature_tier="t2", pca_enabled=True,
+            pca_min_variance=0.95,
+            adx_period=14, vol_of_vol_window=10,
+            vpin_bucket_size=50, vpin_n_buckets=20,
+        )
+        features, _ = build_features_v2(bar_df, cfg)
+        detector = RegimeDetectorV2(cfg)
+        detector.fit(features)
+        detector.reset()
+
+        got_output = False
+        for row in bar_df.iter_rows(named=True):
+            bar = {
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+            }
+            result = detector.update(bar)
+            if result is not None:
+                got_output = True
+                assert isinstance(result, RegimeProba)
+                assert abs(sum(result.probabilities) - 1.0) < 1e-3
+                break
+
+        assert got_output, "Never got output from T2 online prediction"
