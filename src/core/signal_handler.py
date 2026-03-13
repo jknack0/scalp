@@ -196,6 +196,19 @@ class SignalHandler:
             # Run signal engine once on the full window to warm up all signals
             self._signal_engine.compute(self._bar_window)
 
+            # Wait for async signals (regime_v2) to finish warmup computation
+            # No live feed yet, so blocking is safe and ensures regime is ready
+            for signal in self._signal_engine._signals:
+                pending = getattr(signal, "_pending", None)
+                if pending is not None:
+                    logger.info("warmup_waiting_async", signal=signal.name)
+                    t0 = _time.perf_counter()
+                    pending.result(timeout=120)  # block up to 2 min
+                    # Harvest the result
+                    signal.compute(self._bar_window)
+                    dt = _time.perf_counter() - t0
+                    logger.info("warmup_async_done", signal=signal.name, seconds=round(dt, 1))
+
             logger.info("warmup_complete", bars_loaded=len(self._bar_window),
                          window_size=len(self._bar_window), bar_freq=bar_freq)
 
