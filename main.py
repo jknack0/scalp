@@ -38,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy", nargs="*", default=None,
-        help="Strategy names to run (default: vwap_band, gap, va). "
+        help="Strategy names to run (default: vwap_band, donchian). "
              "Options: vwap_band, gap, va, orb, cvd, ttm, macd, poc_va, "
              "stoch_bb, ema_ribbon, micro, regime, pdh_pdl, donchian, mfi_obv, ib",
     )
@@ -75,7 +75,7 @@ def _build_strategies(names: list[str] | None) -> list:
     import importlib
 
     if names is None:
-        names = ["vwap_band", "gap", "va"]
+        names = ["vwap_band", "donchian"]
 
     available = ", ".join(sorted(_STRATEGY_MAP.keys()))
     strategies = []
@@ -132,16 +132,33 @@ async def main() -> None:
     strategy_names = [s.strategy_id for s in strategies]
     logger.info("strategies_loaded", strategies=strategy_names)
 
-    # ── Signal + Filter engines (loaded from strategy YAML) ───
-    from config.loader import build_filter_engine, build_signal_engine, load_strategy_config
+    # ── Signal + Filter engines (loaded from strategy YAMLs) ───
+    from config.loader import build_signal_engine, load_strategy_config
+    from src.filters.filter_engine import FilterEngine
     from src.signals.signal_bundle import SignalEngine
-    # Use first strategy's YAML for signal/filter config
-    first_strat = (args.strategy or ["vwap_band"])[0].lower()
-    _, yaml_path = _STRATEGY_MAP.get(first_strat, (None, None))
-    yaml_name = yaml_path.replace("config/strategies/", "").replace(".yaml", "") if yaml_path else first_strat
-    yaml_cfg = load_strategy_config(yaml_name)
-    signal_engine = build_signal_engine(yaml_cfg)
-    filter_engine = build_filter_engine(yaml_cfg)
+
+    strat_names = args.strategy or ["vwap_band", "donchian"]
+    all_signals: list[str] = []
+    all_signal_configs: dict = {}
+    yaml_cfgs: list[dict] = []
+    for sname in strat_names:
+        sname = sname.lower()
+        _, ypath = _STRATEGY_MAP.get(sname, (None, None))
+        if ypath is None:
+            continue
+        yname = ypath.replace("config/strategies/", "").replace(".yaml", "")
+        ycfg = load_strategy_config(yname)
+        yaml_cfgs.append(ycfg)
+        for sig in ycfg.get("signals", []):
+            if sig not in all_signals:
+                all_signals.append(sig)
+        all_signal_configs.update(ycfg.get("signal_configs", {}))
+
+    signal_engine = SignalEngine(all_signals, all_signal_configs) if all_signals else None
+    # Each strategy has its own FilterEngine — use empty handler-level filter
+    filter_engine = FilterEngine()
+    yaml_cfg = yaml_cfgs[0] if yaml_cfgs else {}
+    logger.info("multi_strategy_signals", signals=all_signals)
 
     # ── Trade store (persist trades to Postgres) ─────────────
     import os

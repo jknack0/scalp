@@ -82,4 +82,60 @@ def bundle_from_row(
             },
         )
 
+    if "adx" in signal_names and "sig_adx_value" in row:
+        adx_val = float(row["sig_adx_value"])
+        results["adx"] = SignalResult(
+            value=adx_val,
+            passes=bool(row["sig_adx_passes"]),
+            direction=row["sig_adx_direction"],
+            metadata={
+                "adx": adx_val,
+                "plus_di": float(row["sig_adx_plus_di"]),
+                "minus_di": float(row["sig_adx_minus_di"]),
+            },
+        )
+
+    if "donchian_channel" in signal_names and "sig_dc_value" in row:
+        dc_val = float(row["sig_dc_value"])
+        results["donchian_channel"] = SignalResult(
+            value=dc_val,
+            passes=bool(row["sig_dc_passes"]),
+            direction=row["sig_dc_direction"],
+            metadata={
+                "entry_upper": float(row["sig_dc_entry_upper"]) if row["sig_dc_entry_upper"] is not None else 0.0,
+                "entry_lower": float(row["sig_dc_entry_lower"]) if row["sig_dc_entry_lower"] is not None else 0.0,
+                "exit_upper": float(row["sig_dc_exit_upper"]) if row["sig_dc_exit_upper"] is not None else 0.0,
+                "exit_lower": float(row["sig_dc_exit_lower"]) if row["sig_dc_exit_lower"] is not None else 0.0,
+                "width": dc_val,
+                "mid": (float(row["sig_dc_entry_upper"] or 0) + float(row["sig_dc_entry_lower"] or 0)) / 2.0,
+            },
+        )
+
+    if "session_time" in signal_names and "sig_session_time_value" in row:
+        st_val = float(row["sig_session_time_value"])
+        results["session_time"] = SignalResult(
+            value=st_val,
+            passes=True,
+            direction="none",
+            metadata={},
+        )
+
+    if "regime_v2" in signal_names and "sig_regime_v2_value" in row:
+        regime_val = int(row["sig_regime_v2_value"])
+        halt = bool(row.get("sig_regime_v2_whipsaw_halt", False))
+        pos_size = row.get("sig_regime_v2_position_size", "flat")
+        results["regime_v2"] = SignalResult(
+            value=float(regime_val),
+            passes=not halt and pos_size != "flat",
+            direction="none",
+            metadata={
+                "regime": regime_val,
+                "confidence": float(row["sig_regime_v2_confidence"]),
+                "position_size": pos_size,
+                "p_trending": float(row["sig_regime_v2_p_trending"]),
+                "p_ranging": float(row["sig_regime_v2_p_ranging"]),
+                "p_high_vol": float(row["sig_regime_v2_p_high_vol"]),
+            },
+        )
+
     return SignalBundle(results=results, bar_count=len(signal_names))

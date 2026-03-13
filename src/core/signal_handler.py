@@ -233,14 +233,10 @@ class SignalHandler:
 
             bundle = self._signal_engine.compute(self._bar_window)
 
-            # Evaluate filters
+            # Log signal snapshot every bar (with 5m bars = 12/hour)
+            # Each strategy has its own FilterEngine — no handler-level gate
             filter_result = self._filter_engine.evaluate(bundle)
-
-            # Log signal + filter snapshot every bar (with 5m bars = 12/hour)
             self._log_snapshot(bar, bundle, filter_result)
-
-            if not filter_result.passes:
-                return
 
         for strategy in self._strategies:
             try:

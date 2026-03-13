@@ -41,6 +41,14 @@ def enrich_bars(
             df = _compute_relative_volume(df)
         elif name == "spread":
             df = _compute_spread(df)
+        elif name == "adx":
+            df = _compute_adx(df)
+        elif name == "donchian_channel":
+            df = _compute_donchian_channel(df)
+        elif name == "session_time":
+            df = _compute_session_time(df)
+        elif name == "regime_v2":
+            df = _compute_regime_v2(df)
         else:
             raise ValueError(f"Unknown signal for vectorized computation: {name}")
     return df
@@ -315,3 +323,194 @@ def _compute_spread(
     )
     df = df.drop(["_raw_spread"])
     return df
+
+
+# ── ADX ──────────────────────────────────────────────────────────────────
+
+
+def _compute_adx(
+    df: pl.DataFrame,
+    period: int = 14,
+    threshold: float = 25.0,
+) -> pl.DataFrame:
+    """Add ADX columns: sig_adx_value, sig_adx_passes, sig_adx_direction, sig_adx_plus_di, sig_adx_minus_di."""
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    close = df["close"].to_numpy()
+    n = len(df)
+
+    if n < 2:
+        return df.with_columns(
+            pl.lit(0.0).alias("sig_adx_value"),
+            pl.lit(False).alias("sig_adx_passes"),
+            pl.lit("none").alias("sig_adx_direction"),
+            pl.lit(0.0).alias("sig_adx_plus_di"),
+            pl.lit(0.0).alias("sig_adx_minus_di"),
+        )
+
+    # True Range, +DM, -DM (from bar 1 onward)
+    tr = np.empty(n - 1, dtype=np.float64)
+    plus_dm = np.empty(n - 1, dtype=np.float64)
+    minus_dm = np.empty(n - 1, dtype=np.float64)
+
+    for i in range(1, n):
+        tr[i - 1] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+        up = high[i] - high[i - 1]
+        down = low[i - 1] - low[i]
+        plus_dm[i - 1] = up if (up > down and up > 0) else 0.0
+        minus_dm[i - 1] = down if (down > up and down > 0) else 0.0
+
+    # Wilder smooth
+    atr_s = _wilder_smooth(tr, period)
+    plus_di_s = _wilder_smooth(plus_dm, period)
+    minus_di_s = _wilder_smooth(minus_dm, period)
+
+    # +DI and -DI
+    plus_di = np.where(atr_s > 0, 100.0 * plus_di_s / atr_s, 0.0)
+    minus_di = np.where(atr_s > 0, 100.0 * minus_di_s / atr_s, 0.0)
+
+    # DX -> ADX
+    di_sum = plus_di + minus_di
+    dx = np.where(di_sum > 0, 100.0 * np.abs(plus_di - minus_di) / di_sum, 0.0)
+    adx = _wilder_smooth(dx, period)
+
+    # Pad first bar with zeros (signals start from bar 1)
+    adx_full = np.zeros(n, dtype=np.float64)
+    adx_full[1:] = adx
+    plus_di_full = np.zeros(n, dtype=np.float64)
+    plus_di_full[1:] = plus_di
+    minus_di_full = np.zeros(n, dtype=np.float64)
+    minus_di_full[1:] = minus_di
+
+    passes = adx_full >= threshold
+    direction = np.where(plus_di_full > minus_di_full, "long",
+                         np.where(minus_di_full > plus_di_full, "short", "none"))
+
+    return df.with_columns(
+        pl.Series("sig_adx_value", adx_full),
+        pl.Series("sig_adx_passes", passes),
+        pl.Series("sig_adx_direction", direction),
+        pl.Series("sig_adx_plus_di", plus_di_full),
+        pl.Series("sig_adx_minus_di", minus_di_full),
+    )
+
+
+# ── Donchian Channel ────────────────────────────────────────────────────
+
+
+def _compute_donchian_channel(
+    df: pl.DataFrame,
+    entry_period: int = 20,
+    exit_period: int = 10,
+) -> pl.DataFrame:
+    """Add Donchian channel columns: sig_dc_value (width), sig_dc_passes, sig_dc_direction, etc."""
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    close = df["close"].to_numpy()
+    n = len(df)
+
+    min_bars = max(entry_period, exit_period) + 1
+
+    entry_upper = np.full(n, np.nan, dtype=np.float64)
+    entry_lower = np.full(n, np.nan, dtype=np.float64)
+    exit_upper = np.full(n, np.nan, dtype=np.float64)
+    exit_lower = np.full(n, np.nan, dtype=np.float64)
+    width = np.zeros(n, dtype=np.float64)
+    passes = np.zeros(n, dtype=bool)
+    direction = np.full(n, "none", dtype=object)
+
+    for i in range(min_bars, n):
+        # Channels from N bars BEFORE current bar (exclude current)
+        eu = float(np.max(high[i - entry_period:i]))
+        el = float(np.min(low[i - entry_period:i]))
+        xu = float(np.max(high[i - exit_period:i]))
+        xl = float(np.min(low[i - exit_period:i]))
+
+        entry_upper[i] = eu
+        entry_lower[i] = el
+        exit_upper[i] = xu
+        exit_lower[i] = xl
+        width[i] = eu - el
+
+        c = close[i]
+        if c > eu:
+            passes[i] = True
+            direction[i] = "long"
+        elif c < el:
+            passes[i] = True
+            direction[i] = "short"
+
+    return df.with_columns(
+        pl.Series("sig_dc_value", width),
+        pl.Series("sig_dc_passes", passes),
+        pl.Series("sig_dc_direction", direction.astype(str)),
+        pl.Series("sig_dc_entry_upper", entry_upper),
+        pl.Series("sig_dc_entry_lower", entry_lower),
+        pl.Series("sig_dc_exit_upper", exit_upper),
+        pl.Series("sig_dc_exit_lower", exit_lower),
+    )
+
+
+# ── Session Time ────────────────────────────────────────────────────────
+
+
+def _compute_session_time(df: pl.DataFrame) -> pl.DataFrame:
+    """Add session_time column: minutes since midnight in US/Eastern."""
+    return df.with_columns(
+        (pl.col("_et_ts").dt.hour().cast(pl.Int32) * 60 + pl.col("_et_ts").dt.minute().cast(pl.Int32))
+        .cast(pl.Float64)
+        .alias("sig_session_time_value"),
+    )
+
+
+# ── Regime V2 ──────────────────────────────────────────────────────────
+
+
+def _compute_regime_v2(df: pl.DataFrame) -> pl.DataFrame:
+    """Add regime_v2 columns using batch HMM inference.
+
+    Loads the trained RegimeDetectorV2 model and runs predict_proba_sequence
+    over all bars.  Warm-up rows (where features can't be computed) get
+    regime=1 (RANGING), confidence=0, position_size="flat".
+    """
+    from src.models.regime_detector_v2 import (
+        RegimeDetectorV2,
+        build_features_v2,
+    )
+
+    detector = RegimeDetectorV2.load("models/regime_v2")
+    features, feat_ts = build_features_v2(df, detector.config)
+    probas = detector.predict_proba_sequence(features)
+
+    n_total = len(df)
+    n_feat = len(features)
+    warmup = n_total - n_feat  # rows dropped by feature extraction
+
+    # Pre-fill arrays for warmup rows
+    regime = np.full(n_total, 1, dtype=np.int32)  # RANGING default
+    confidence = np.zeros(n_total, dtype=np.float64)
+    p_trending = np.zeros(n_total, dtype=np.float64)
+    p_ranging = np.zeros(n_total, dtype=np.float64)
+    p_high_vol = np.zeros(n_total, dtype=np.float64)
+    position_size = np.full(n_total, "flat", dtype=object)
+    whipsaw_halt = np.full(n_total, True, dtype=bool)
+
+    for i, p in enumerate(probas):
+        idx = warmup + i
+        regime[idx] = p.regime.value
+        confidence[idx] = p.confidence
+        p_trending[idx] = p.probabilities[0]
+        p_ranging[idx] = p.probabilities[1]
+        p_high_vol[idx] = p.probabilities[2]
+        position_size[idx] = p.position_size
+        whipsaw_halt[idx] = p.whipsaw_halt
+
+    return df.with_columns(
+        pl.Series("sig_regime_v2_value", regime),
+        pl.Series("sig_regime_v2_confidence", confidence),
+        pl.Series("sig_regime_v2_p_trending", p_trending),
+        pl.Series("sig_regime_v2_p_ranging", p_ranging),
+        pl.Series("sig_regime_v2_p_high_vol", p_high_vol),
+        pl.Series("sig_regime_v2_position_size", position_size.astype(str)),
+        pl.Series("sig_regime_v2_whipsaw_halt", whipsaw_halt),
+    )

@@ -111,6 +111,7 @@ class BacktestConfig:
     filter_engine: FilterEngine | None = None
     prebuilt_bundles: list | None = None  # Pre-computed SignalBundles indexed by bar position
     enriched_signal_names: list[str] | None = None  # Signal names for inline bundle construction from sig_* columns
+    exit_engine: ExitEngine | None = None  # Declarative exits from YAML 'exits:' section
     # Multi-timeframe filter support: map seq -> prebuilt SignalBundle list
     # seq=1 uses signal_engine/prebuilt_bundles above.
     # Higher seqs supply their own pre-computed bundles (e.g. 15m signals for seq=2).
@@ -684,6 +685,7 @@ class BacktestEngine:
             commission_model=config.commission_model,
             slippage_model=config.slippage_model,
             max_position=config.max_position,
+            exit_engine=config.exit_engine,
         )
 
         # Bar window for signal computation
@@ -794,6 +796,7 @@ class BacktestEngine:
             trades = oms.on_bar(
                 bar_event, bar_index, bar_time, bar_date, current_atr,
                 early_exit_fn=early_exit_fn,
+                bundle=bundle,
             )
             all_trades.extend(trades)
 

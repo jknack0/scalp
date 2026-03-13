@@ -1,12 +1,14 @@
 # Strategy 12: Donchian Channel Breakout
 # Trend-following breakout on 20-bar Donchian channel with 10-bar trailing exit channel.
 # ADX and relative volume filters gate entries to high-conviction breakouts only.
+# Tuned 2026-03-13: full 11-param sweep over 2024 (4,608 configs, no regime gate).
+# Best: Sharpe 3.47, 56.7% WR, $851 PnL, 104 trades, 3.5% DD, PF 1.53.
 
 strategy:
   strategy_id: donchian_breakout
-  max_signals_per_day: 3
-  session_start: "09:30"
-  session_end: "16:00"
+  max_signals_per_day: 5
+  session_start: "10:00"
+  session_end: "14:00"
 
 bar:
   type: time
@@ -21,27 +23,33 @@ signal_configs:
     exit_period: 10
   adx:
     period: 14
-    threshold: 18.0
+    threshold: 30.0
+
+donchian:
+  target_atr: 2.0
+  stop_atr: 1.5
+  width_min: 2.0
+  width_max: 30.0
 
 # All entry gates are declarative filters
 filters:
-  # Time-of-day: 9:45 AM - 3:00 PM ET (minutes since midnight)
+  # Time-of-day: 10:00 AM - 2:00 PM ET (minutes since midnight)
   - signal: session_time
-    expr: ">= 585"
+    expr: ">= 600"
   - signal: session_time
-    expr: "<= 900"
+    expr: "<= 840"
   # Donchian channel breakout required
   - signal: donchian_channel
     expr: passes
-  # ADX must show trending conditions
+  # ADX must show strong trend
   - signal: adx
-    expr: "> 18.0"
-  # Volume must be at or above average
+    expr: "> 30.0"
+  # Volume confirmation
   - signal: relative_volume
-    expr: ">= 1.0"
+    expr: ">= 0.8"
 
 exit:
-  time_stop_minutes: 45
+  time_stop_minutes: 90
 
 # Declarative exits — evaluated by ExitEngine each bar (OR logic)
 exits:
@@ -51,7 +59,7 @@ exits:
     enabled: true
   - type: time_stop
     enabled: true
-    max_bars: 9
+    max_bars: 18
   # Trailing stop via 10-bar exit channel
   - type: price_vs_signal_exit
     enabled: true
@@ -62,4 +70,4 @@ exits:
   - type: signal_bound_exit
     enabled: true
     signal: adx
-    lower_bound: 15.0
+    lower_bound: 12.0

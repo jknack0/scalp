@@ -44,6 +44,13 @@ class DonchianBreakoutStrategy:
         exit_cfg = config.get("exit", {})
         self._time_stop_minutes: int = exit_cfg.get("time_stop_minutes", 45)
 
+        # Entry geometry (configurable for sweeps)
+        donchian_cfg = config.get("donchian", {})
+        self._target_atr: float = donchian_cfg.get("target_atr", 3.0)
+        self._stop_atr: float = donchian_cfg.get("stop_atr", 1.5)
+        self._width_min: float = donchian_cfg.get("width_min", 3.0)
+        self._width_max: float = donchian_cfg.get("width_max", 20.0)
+
         # Build FilterEngine from YAML filters
         self._filter_engine = FilterEngine.from_list(config.get("filters"))
 
@@ -82,8 +89,8 @@ class DonchianBreakoutStrategy:
 
         width = donchian_meta.get("width", 0.0)
 
-        # Width filter: channel must be 3-20 points (not too tight, not too wide)
-        if width < 3.0 or width > 20.0:
+        # Width filter: channel must be within bounds (not too tight, not too wide)
+        if width < self._width_min or width > self._width_max:
             logger.debug("blocked_width", time=now.strftime("%H:%M"),
                          width=round(width, 2))
             return None
@@ -122,15 +129,13 @@ class DonchianBreakoutStrategy:
             logger.debug("blocked_no_atr", time=now.strftime("%H:%M"))
             return None
 
-        # Compute target and stop manually
-        # Target: entry +/- 3.0 * ATR
-        # Initial stop: entry -/+ 1.5 * ATR
+        # Compute target and stop
         if direction == Direction.LONG:
-            target = entry_price + 3.0 * atr_raw
-            initial_stop = entry_price - 1.5 * atr_raw
+            target = entry_price + self._target_atr * atr_raw
+            initial_stop = entry_price - self._stop_atr * atr_raw
         else:
-            target = entry_price - 3.0 * atr_raw
-            initial_stop = entry_price + 1.5 * atr_raw
+            target = entry_price - self._target_atr * atr_raw
+            initial_stop = entry_price + self._stop_atr * atr_raw
 
         # Geometry sanity check
         if direction == Direction.LONG:

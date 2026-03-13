@@ -8,6 +8,8 @@ MES micro E-mini S&P 500 futures scalping bot. Event-driven async Python archite
 
 ## Commands
 
+Always use `python -u` (unbuffered) when running scripts so output streams in real time.
+
 ```bash
 # Install dependencies
 uv sync
@@ -207,3 +209,18 @@ Structured logging via `structlog` (`src/core/logging.py`). Dual output: JSON ro
 - Tests use `pytest-asyncio` with `asyncio_mode = "auto"` -- no need for `@pytest.mark.asyncio`
 - MES tick size: $1.25 per tick (0.25 index points x $5 multiplier)
 - Commission: $0.295/side, $0.59 round trip (Tradovate Free plan)
+
+
+## Remote execution (training/backtesting/optimization)
+
+When running training, backtesting, or optimization scripts, **always write results to a file** so they can be read back via SSH:
+
+- **Logs**: Write to `logs/<script_name>.log` (use `tee` or Python logging to file)
+- **Results/metrics**: Write JSON summaries to `results/<strategy>/`
+- **Model artifacts**: Save to `models/`
+- **Console output**: Pipe through `tee` so output goes to both terminal and file, e.g.:
+  ```bash
+  python -u scripts/backtest/cpcv.py --strategy orb 2>&1 | tee logs/cpcv_orb.log
+  ```
+
+This allows progress and results to be checked remotely without an interactive terminal.
