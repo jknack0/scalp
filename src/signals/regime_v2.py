@@ -4,11 +4,14 @@ Wraps RegimeDetectorV2 to produce a SignalResult compatible with
 FilterEngine (passes gate) and ExitEngine (regime_exit via int value).
 
 Feeds bars incrementally — only new bars are ingested on each compute() call.
+Computation runs in a background thread to avoid blocking the event loop.
+Returns the most recent completed result (at most one bar stale).
 """
 
 from __future__ import annotations
 
 import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from src.core.events import BarEvent
@@ -17,6 +20,14 @@ from src.signals.base import SignalBase, SignalResult
 from src.signals.registry import SignalRegistry
 
 _logger = logging.getLogger(__name__)
+
+# Safe default until first background computation completes
+_DEFAULT_RESULT = SignalResult(
+    value=1.0,  # RANGING
+    passes=False,
+    direction="none",
+    metadata={"reason": "not_yet_computed", "async": True},
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,11 @@ class RegimeV2Signal(SignalBase):
         self._detector = detector
         self._bars_fed: int = 0
 
+        # Background computation state
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="regime_v2")
+        self._last_result: SignalResult = _DEFAULT_RESULT
+        self._pending: Future | None = None
+
         # Auto-load detector from model_path if not injected
         if self._detector is None and self.config.model_path:
             from pathlib import Path
@@ -86,6 +102,12 @@ class RegimeV2Signal(SignalBase):
                 )
 
     def compute(self, bars: list[BarEvent]) -> SignalResult:
+        """Non-blocking compute — dispatches work to background thread.
+
+        Returns the most recent completed result immediately (at most one
+        5m bar stale).  For a regime detector that classifies multi-hour
+        market regimes, one-bar latency is acceptable.
+        """
         # No detector loaded — pass-through
         if self._detector is None:
             return SignalResult(
@@ -96,21 +118,37 @@ class RegimeV2Signal(SignalBase):
             )
 
         if not bars:
-            return SignalResult(
-                value=0.0,
-                passes=True,
-                direction="none",
-                metadata={"reason": "no_bars"},
+            return self._last_result
+
+        # Harvest completed result if ready
+        if self._pending is not None and self._pending.done():
+            try:
+                self._last_result = self._pending.result()
+            except Exception:
+                _logger.exception("regime_v2_bg_error")
+            self._pending = None
+
+        # Submit new work if nothing pending
+        if self._pending is None:
+            # Shallow copy — BarEvent is frozen, safe to share
+            bars_snapshot = list(bars)
+            bars_fed_snapshot = self._bars_fed
+            self._pending = self._executor.submit(
+                self._compute_sync, bars_snapshot, bars_fed_snapshot
             )
 
+        return self._last_result
+
+    def _compute_sync(self, bars: list[BarEvent], bars_fed: int) -> SignalResult:
+        """Blocking computation — runs in background thread."""
         # Feed only new bars (incremental).
         # The bar window is a sliding window capped at 500 — old bars get
         # trimmed from the front, so _bars_fed can exceed len(bars).
         # When that happens, only the last bar (just appended) is new.
-        if self._bars_fed >= len(bars):
+        if bars_fed >= len(bars):
             new_bars = bars[-1:]
         else:
-            new_bars = bars[self._bars_fed:]
+            new_bars = bars[bars_fed:]
         proba = None
         for bar in new_bars:
             proba = self._detector.update(_bar_to_dict(bar))
@@ -165,3 +203,7 @@ class RegimeV2Signal(SignalBase):
                 "pass_states": [l.name for l in pass_labels],
             },
         )
+
+    def shutdown(self) -> None:
+        """Clean up the background thread pool."""
+        self._executor.shutdown(wait=False)
