@@ -19,7 +19,7 @@ from src.core.events import EventBus
 from src.core.logging import configure_logging, get_logger
 from src.core.session import SessionManager
 from src.core.signal_handler import SignalHandler
-from src.core.tick_aggregator import TickAggregator
+# TickAggregator no longer needed — feed emits 1s bars directly via ohlcv-1s
 from src.feeds.databento_feed import DatabentoFeed
 from src.feeds.tradovate import TradovateFeed
 from src.monitoring.health import HealthMonitor
@@ -202,13 +202,10 @@ async def main() -> None:
             bar_freq=bar_freq,
         )
 
-    # ── Tick aggregator (ticks → bars) ───────────────────────
-    aggregator = TickAggregator(
-        bus,
-        symbol=config.symbol,
-        interval_seconds=args.bar_interval,
-    )
-    bus.subscribe(EventType.TICK, aggregator.on_tick)
+    # ── Tick aggregator (disabled — feed now emits 1s bars directly) ──
+    # TickAggregator was needed when using mbp-1 tick feed.
+    # With ohlcv-1s, DatabentoFeed emits BarEvents directly.
+    # TickEvents are still emitted (close price) for paper bracket fills.
 
     # ── Bar store (persist 1m bars to Postgres) ──────────────
     bar_store: BarStore | None = None
@@ -247,7 +244,6 @@ async def main() -> None:
         stop_event.set()
         bus.stop()
         session.stop()
-        aggregator.stop()
         fill_monitor.stop()
         if feed:
             feed.stop()
@@ -269,7 +265,6 @@ async def main() -> None:
         asyncio.create_task(bus.run(), name="event_bus"),
         asyncio.create_task(session.run(), name="session_manager"),
         asyncio.create_task(health.start(), name="health_monitor"),
-        asyncio.create_task(aggregator.run(), name="tick_aggregator"),
         asyncio.create_task(fill_monitor.run(), name="fill_monitor"),
     ]
     if feed:

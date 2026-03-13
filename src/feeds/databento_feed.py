@@ -1,14 +1,15 @@
 """Databento live market data feed.
 
 Connects to Databento's Live Subscription Gateway for real-time CME
-futures data (MBP-1 / top-of-book). Publishes TickEvents to the EventBus.
+futures data via OHLCV-1s bars. Publishes BarEvents (1s) and TickEvents
+(close price, for paper bracket fills) to the EventBus.
 
-Uses the same BaseFeed interface as TradovateFeed, so it's a drop-in
-replacement for market data while Tradovate handles order execution.
+Uses ohlcv-1s instead of mbp-1 to reduce data volume by ~99% while
+retaining 1s fill resolution for paper mode.
 
 Usage:
     feed = DatabentoFeed(event_bus=bus, config=config)
-    await feed.run()  # blocks, streaming ticks
+    await feed.run()  # blocks, streaming bars
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from collections import deque
 import databento as db
 
 from src.core.config import BotConfig
-from src.core.events import EventBus, TickEvent
+from src.core.events import BarEvent, EventBus, TickEvent
 from src.core.logging import get_logger
 from src.feeds.base import BaseFeed
 
@@ -31,9 +32,10 @@ _DATASET = "GLBX.MDP3"
 
 
 class DatabentoFeed(BaseFeed):
-    """Databento live feed for CME futures via MBP-1 (top-of-book).
+    """Databento live feed for CME futures via OHLCV-1s bars.
 
-    Streams best bid/ask + last trade and converts to TickEvents.
+    Streams 1s OHLCV bars and emits both BarEvent (for signal pipeline)
+    and TickEvent (close price, for paper bracket fills).
     """
 
     def __init__(self, event_bus: EventBus, config: BotConfig) -> None:
@@ -42,14 +44,18 @@ class DatabentoFeed(BaseFeed):
         self._client: db.Live | None = None
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._tick_count = 0
+        self._bar_count = 0
         self._last_tick_time = time.monotonic()
         self._latency_samples: deque[float] = deque(maxlen=10_000)
         self._stop_event = asyncio.Event()
+        # instrument_id for the target symbol (set from SymbolMappingMsg)
+        self._target_instrument_id: int | None = None
+        self._target_symbol: str = config.symbol  # e.g. "MESH6"
+        self._filtered_count = 0
 
     @property
     def tick_count(self) -> int:
-        return self._tick_count
+        return self._bar_count
 
     @property
     def latency_stats(self) -> dict[str, float]:
@@ -73,21 +79,19 @@ class DatabentoFeed(BaseFeed):
         logger.info("client_created")
 
     async def subscribe(self, symbol: str) -> None:
-        """Subscribe to MBP-1 (top-of-book) for the symbol."""
+        """Subscribe to OHLCV-1s for the target symbol."""
         if not self._client:
             raise ConnectionError("Client not created — call connect() first")
 
-        # Databento uses continuous front-month via stype_in="parent"
-        # e.g. "MES.FUT" for micro E-mini S&P front month
-        root = symbol[:3] if len(symbol) > 3 else symbol  # MES from MESH6
-
+        # Subscribe directly to the specific contract (e.g. "MESH6")
+        # using raw_symbol to avoid getting all contracts in the parent group
         self._client.subscribe(
             dataset=_DATASET,
-            schema="mbp-1",
-            symbols=f"{root}.FUT",
-            stype_in="parent",
+            schema="ohlcv-1s",
+            symbols=symbol,
+            stype_in="raw_symbol",
         )
-        logger.info("subscribed", symbol=f"{root}.FUT", schema="mbp-1")
+        logger.info("subscribed", symbol=symbol, schema="ohlcv-1s")
 
     async def disconnect(self) -> None:
         """Stop the live client."""
@@ -118,21 +122,21 @@ class DatabentoFeed(BaseFeed):
             await asyncio.sleep(30)
             if not self._running:
                 break
-            delta = self._tick_count - last_count
-            last_count = self._tick_count
+            delta = self._bar_count - last_count
+            last_count = self._bar_count
             stale_sec = time.monotonic() - self._last_tick_time
             stats = self.latency_stats
             logger.info(
                 "feed_heartbeat",
-                total_ticks=self._tick_count,
-                ticks_30s=delta,
+                total_bars=self._bar_count,
+                bars_30s=delta,
                 stale_sec=round(stale_sec, 1),
                 avg_latency_ms=round(stats["avg_ms"], 1),
                 p99_latency_ms=round(stats["p99_ms"], 1),
             )
 
     async def run(self) -> None:
-        """Main loop: connect, subscribe, stream ticks via callback."""
+        """Main loop: connect, subscribe, stream 1s bars via callback."""
         self._running = True
         self._loop = asyncio.get_running_loop()
         self._stop_event.clear()
@@ -158,7 +162,7 @@ class DatabentoFeed(BaseFeed):
             # If start() returns, the session ended or connection was lost
             logger.warning(
                 "feed_client_returned",
-                tick_count=self._tick_count,
+                bar_count=self._bar_count,
                 hint="client.start() returned — connection may have dropped",
             )
 
@@ -174,28 +178,31 @@ class DatabentoFeed(BaseFeed):
             if heartbeat_task:
                 heartbeat_task.cancel()
             await self.disconnect()
-            logger.info("feed_stopped", tick_count=self._tick_count)
+            logger.info("feed_stopped", bar_count=self._bar_count)
 
     def _on_record(self, record: object) -> None:
         """Callback invoked by Databento for each record (from its thread)."""
         if not self._running:
             return
 
-        # Only process MBP1Msg records (skip SystemMsg, SymbolMappingMsg, etc.)
-        if type(record).__name__ != "MBP1Msg":
+        record_type = type(record).__name__
+
+        # Skip non-OHLCV records (SystemMsg, SymbolMappingMsg, etc.)
+        if record_type != "OHLCVMsg":
             return
 
         try:
-            level = record.levels[0]
+            # Databento uses fixed-point prices (1e9 scale)
+            open_px = record.open / 1e9
+            high_px = record.high / 1e9
+            low_px = record.low / 1e9
+            close_px = record.close / 1e9
+            volume = record.volume
 
-            bid = level.bid_px / 1e9  # Databento uses fixed-point (1e9)
-            ask = level.ask_px / 1e9
+            # Skip empty bars (no trades in this second)
+            if volume == 0 or close_px <= 0:
+                return
 
-            # Trade info from the record
-            last_price = record.price / 1e9 if hasattr(record, "price") else 0.0
-            last_size = record.size if hasattr(record, "size") else 0
-
-            # Timestamp in nanoseconds (Databento native)
             ts_ns = record.ts_event
 
             # Latency calculation
@@ -205,26 +212,36 @@ class DatabentoFeed(BaseFeed):
                 self._latency_samples.append(latency_ms)
 
             self._last_tick_time = time.monotonic()
-            self._tick_count += 1
+            self._bar_count += 1
 
-            # Use mid price as last if no trade price
-            if last_price <= 0 and bid > 0 and ask > 0:
-                last_price = (bid + ask) / 2
+            symbol = self._config.symbol
 
-            tick = TickEvent(
-                symbol=self._config.symbol,
-                bid=bid,
-                ask=ask,
-                last_price=last_price,
-                last_size=last_size,
+            # Emit BarEvent (for signal pipeline / bar resampler)
+            bar = BarEvent(
+                symbol=symbol,
+                open=open_px,
+                high=high_px,
+                low=low_px,
+                close=close_px,
+                volume=volume,
+                bar_type="1s",
                 timestamp_ns=ts_ns,
             )
+            asyncio.run_coroutine_threadsafe(self._bus.publish(bar), self._loop)
 
-            # Thread-safe publish to the async event bus
+            # Emit TickEvent with close price (for paper bracket fill checking)
+            tick = TickEvent(
+                symbol=symbol,
+                bid=0.0,
+                ask=0.0,
+                last_price=close_px,
+                last_size=0,
+                timestamp_ns=ts_ns,
+            )
             asyncio.run_coroutine_threadsafe(self._bus.publish(tick), self._loop)
 
         except Exception as e:
-            logger.warning("tick_parse_error", error=str(e))
+            logger.warning("bar_parse_error", error=str(e))
 
     def _on_error(self, exc: Exception) -> None:
         """Callback for Databento client errors."""
