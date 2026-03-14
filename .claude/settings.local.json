@@ -77,7 +77,8 @@
       "Bash(.venv/Scripts/python.exe -u scripts/tick_predictor/validate_robustness.py --start 2025-01-01 --end 2026-03-14 --tp-ticks 24 --sl-ticks 12 2>&1 | tee logs/tick_predictor_robustness.log)",
       "Bash(.venv/Scripts/python.exe -u scripts/tick_predictor/validate_robustness.py --start 2025-01-01 --end 2026-03-14 --tp-ticks 24 --sl-ticks 12 --test flipped 2>&1 | tee -a logs/tick_predictor_robustness.log)",
       "Bash(.venv/Scripts/python.exe -u scripts/backtest/tick_predictor_standalone.py --start 2025-01-01 --end 2026-03-14 --tp-ticks 24 --sl-ticks 12 --sweep 2>&1 | tee logs/tick_predictor_backtest_sweep.log)",
-      "Bash(.venv/Scripts/python.exe -u -c \"\nimport polars as pl\nfrom pathlib import Path\nfor p in sorted\\(Path\\('data/l1'\\).glob\\('year=*/data.parquet'\\)\\):\n    df = pl.read_parquet\\(str\\(p\\)\\)\n    print\\(f'{p.parent.name}: {len\\(df\\):>12,} rows  {df[\\\\\"timestamp\\\\\"].min\\(\\)} -> {df[\\\\\"timestamp\\\\\"].max\\(\\)}'\\)\n\")"
+      "Bash(.venv/Scripts/python.exe -u -c \"\nimport polars as pl\nfrom pathlib import Path\nfor p in sorted\\(Path\\('data/l1'\\).glob\\('year=*/data.parquet'\\)\\):\n    df = pl.read_parquet\\(str\\(p\\)\\)\n    print\\(f'{p.parent.name}: {len\\(df\\):>12,} rows  {df[\\\\\"timestamp\\\\\"].min\\(\\)} -> {df[\\\\\"timestamp\\\\\"].max\\(\\)}'\\)\n\")",
+      "Bash(git log:*)"
     ]
   }
 }

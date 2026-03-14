@@ -60,7 +60,7 @@ COMMISSION_RT = 0.59
 
 def load_features_and_labels() -> tuple[pl.DataFrame, pl.DataFrame]:
     """Load cached features and generate/load labels."""
-    suffix = f"_v5_h{HORIZON_BARS}_tp{TP_TICKS}_sl{SL_TICKS}_rth"
+    suffix = f"_v6_h{HORIZON_BARS}_tp{TP_TICKS}_sl{SL_TICKS}_rth"
     feat_path = DATA_DIR / f"features_{FEATURE_START}_{FEATURE_END}{suffix}.parquet"
 
     if not feat_path.exists():

@@ -81,8 +81,8 @@ class TrainingPipeline:
         """Config-specific suffix for cache filenames."""
         cfg = self.label_config
         rth = "_rth" if self.rth_only else ""
-        # v5: causal regime (forward-only HMM, no future leakage)
-        return f"_v5_h{cfg.vertical_barrier_bars}_tp{cfg.tp_ticks}_sl{cfg.sl_ticks}{rth}"
+        # v6: causal regime + shifted multi-timeframe joins (no future leakage)
+        return f"_v6_h{cfg.vertical_barrier_bars}_tp{cfg.tp_ticks}_sl{cfg.sl_ticks}{rth}"
 
     def run(
         self, start_date: str, end_date: str, val_days: int = 15
@@ -598,10 +598,10 @@ class TrainingPipeline:
             obv_slope[9:] = slopes
         bars_1m = bars_1m.with_columns(pl.Series("obv_slope_1m_raw", obv_slope))
 
-        # Join 1m -> 1s
+        # Join 1m -> 1s (shift timestamps +1m so 1s bars only see PREVIOUS completed 1m bar)
         tac_cols = ["bb_pctb_1m_raw", "rsi_14_1m_raw", "atr_ratio_1m_raw", "obv_slope_1m_raw"]
         bars_1m = bars_1m.with_columns(
-            pl.col("timestamp").dt.epoch("ns").alias("_tf_ts_ns")
+            (pl.col("timestamp") + pl.duration(minutes=1)).dt.epoch("ns").alias("_tf_ts_ns")
         ).select(["_tf_ts_ns"] + tac_cols).sort("_tf_ts_ns")
         df = df.sort("timestamp_ns").join_asof(
             bars_1m, left_on="timestamp_ns", right_on="_tf_ts_ns", strategy="backward",
@@ -664,11 +664,11 @@ class TrainingPipeline:
             .alias("ema_cross_5m_raw")
         )
 
-        # Join 5m -> 1s
+        # Join 5m -> 1s (shift timestamps +5m so 1s bars only see PREVIOUS completed 5m bar)
         strat_cols = ["donchian_pos_5m_raw", "stoch_k_14_5m_raw",
                       "bb_width_5m_raw", "ema_cross_5m_raw"]
         bars_5m = bars_5m.with_columns(
-            pl.col("timestamp").dt.epoch("ns").alias("_tf_ts_ns")
+            (pl.col("timestamp") + pl.duration(minutes=5)).dt.epoch("ns").alias("_tf_ts_ns")
         ).select(["_tf_ts_ns"] + strat_cols).sort("_tf_ts_ns")
         df = df.sort("timestamp_ns").join_asof(
             bars_5m, left_on="timestamp_ns", right_on="_tf_ts_ns", strategy="backward",
@@ -761,7 +761,10 @@ class TrainingPipeline:
         regime_df = pl.DataFrame(regime_records).sort("timestamp_ns")
         print(f"    Regime predictions: {len(regime_df):,} rows")
 
-        # join_asof: each 1s bar gets the most recent 5m regime state
+        # join_asof: shift regime timestamps +5m so 1s bars only see PREVIOUS completed 5m regime
+        regime_df = regime_df.with_columns(
+            (pl.col("timestamp_ns") + 5 * 60 * 1_000_000_000).alias("timestamp_ns")
+        )
         bars_df = bars_df.sort("timestamp_ns")
         bars_df = bars_df.join_asof(
             regime_df,
