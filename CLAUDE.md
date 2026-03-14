@@ -210,22 +210,6 @@ Structured logging via `structlog` (`src/core/logging.py`). Dual output: JSON ro
 - MES tick size: $1.25 per tick (0.25 index points x $5 multiplier)
 - Commission: $0.295/side, $0.59 round trip (Tradovate Free plan)
 
-<<<<<<< HEAD
-
-## Remote execution (training/backtesting/optimization)
-
-When running training, backtesting, or optimization scripts, **always write results to a file** so they can be read back via SSH:
-
-- **Logs**: Write to `logs/<script_name>.log` (use `tee` or Python logging to file)
-- **Results/metrics**: Write JSON summaries to `results/<strategy>/`
-- **Model artifacts**: Save to `models/`
-- **Console output**: Pipe through `tee` so output goes to both terminal and file, e.g.:
-  ```bash
-  python -u scripts/backtest/cpcv.py --strategy orb 2>&1 | tee logs/cpcv_orb.log
-  ```
-
-This allows progress and results to be checked remotely without an interactive terminal.
-=======
 ## Remote Execution Workflow
 
 - Development happens on a ThinkPad T14s (Arch Linux + Hyprland)
@@ -240,4 +224,14 @@ This allows progress and results to be checked remotely without an interactive t
 3. Run the appropriate script
 4. Tail logs, report results back
 5. Commit artifacts and push so ThinkPad can pull them
->>>>>>> cd840ab (laptop to desktop)
+
+### Remote output conventions
+When running training, backtesting, or optimization scripts, **always write results to a file** so they can be read back via SSH:
+
+- **Logs**: Write to `logs/<script_name>.log` (use `tee` or Python logging to file)
+- **Results/metrics**: Write JSON summaries to `results/<strategy>/`
+- **Model artifacts**: Save to `models/`
+- **Console output**: Pipe through `tee` so output goes to both terminal and file, e.g.:
+  ```bash
+  python -u scripts/backtest/cpcv.py --strategy orb 2>&1 | tee logs/cpcv_orb.log
+  ```
