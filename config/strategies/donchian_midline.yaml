@@ -1,0 +1,77 @@
+# Donchian Flavor 3: Midline pullback
+# Enters on pullback to Donchian midline in TRENDING regime. EMA crossover
+# confirms trend direction. Targets the trend-side band.
+# Session: 10:30 AM - 3:45 PM ET (post-IB through power hour).
+
+strategy:
+  strategy_id: donchian_midline
+  max_signals_per_day: 3
+  session_start: "10:30"
+  session_end: "15:45"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+signals: [donchian_channel, adx, ema_crossover, atr, session_time, regime_v2, relative_volume]
+signal_configs:
+  donchian_channel:
+    entry_period: 20
+    exit_period: 10
+    width_percentile_lookback: 100
+    trend_lookback: 5
+  adx:
+    period: 14
+    threshold: 22.0
+  ema_crossover:
+    fast_period: 8
+    slow_period: 21
+  regime_v2:
+    model_path: models/regime_v2
+    pass_states: [TRENDING]
+
+midline:
+  stop_buffer_atr: 0.5
+  trailing_atr: 1.25
+  min_channel_width_atr: 1.5
+
+# Declarative entry filters (AND logic)
+filters:
+  # Session: 10:30 AM - 3:45 PM ET (post-IB, includes power hour)
+  - signal: session_time
+    expr: ">= 630"
+  - signal: session_time
+    expr: "<= 945"
+  # ADX trend confirmation
+  - signal: adx
+    expr: ">= 22.0"
+  # Regime: TRENDING only
+  - signal: regime_v2
+    expr: passes
+  # Moderate volume (lower bar than breakout)
+  - signal: relative_volume
+    expr: ">= 1.0"
+
+exit:
+  time_stop_minutes: 45
+
+# Dynamic exits (ExitEngine, OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 30
+  # Trailing stop
+  - type: trailing_stop
+    enabled: true
+    atr_multiplier: 1.25
+    activation_atr: 0.75
+  # ADX collapse
+  - type: signal_bound_exit
+    enabled: true
+    signal: adx
+    lower_bound: 18.0

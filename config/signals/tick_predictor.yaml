@@ -1,0 +1,77 @@
+# TickDirectionPredictor — Phase 13 Signal Config
+# Loaded by TickPredictorSignal via strategy YAML signal_configs.tick_predictor
+
+model:
+  path: "models/tick_predictor/"
+  lgbm_filename: "lgbm_latest.txt"
+  calibrator_filename: "calibrator_latest.pkl"
+
+  # LightGBM hyperparameters
+  num_leaves: 63
+  max_depth: 7
+  learning_rate: 0.03
+  n_estimators: 300
+  subsample: 0.7
+  colsample_bytree: 0.8
+  min_child_samples: 50
+  early_stopping_rounds: 30
+
+features:
+  ring_buffer_capacity: 200
+  norm_buffer_capacity: 100
+  feature_names:
+    - ofi_10
+    - ofi_30
+    - obi_1
+    - obi_5
+    - microprice
+    - microprice_vs_mid
+    - cvd_delta_10
+    - cvd_delta_30
+    - cvd_slope
+    - volume_imbalance_10
+    - volume_zscore_20
+    - return_1
+    - return_5
+    - return_10
+    - realized_vol_20
+    - return_autocorr_10
+    - spread
+    - spread_zscore_50
+
+labels:
+  vertical_barrier_bars: 15      # 1s bars = 15 second horizon
+  tp_ticks: 4                    # 4 ticks = 1.00 point = $5.00 MES
+  sl_ticks: 3                    # 3 ticks = 0.75 point = $3.75 MES
+  volatility_scale: true
+  vol_lookback_bars: 50
+  min_vol_scale: 0.5
+  max_vol_scale: 2.5
+  tick_size: 0.25
+
+calibration:
+  method: temperature_scaling
+  n_bins: 15
+  recal_window: 1000
+  ece_alert_threshold: 0.08
+  min_samples_for_recal: 50
+
+inference:
+  horizon_bars: 15
+  latency_warn_us: 500
+  latency_history_size: 1000
+
+strategy_integration:
+  filter_min_confidence: 0.60
+  sizing_enabled: false
+  kelly_fraction: 0.25
+  sizing_min_confidence: 0.62
+
+training:
+  lookback_days: 15
+  val_days: 15
+  min_cv_accuracy: 0.52
+  embargo_bars: 20
+  n_cv_splits: 5
+  data_path: "data/parquet/"
+  output_path: "data/tick_predictor/"

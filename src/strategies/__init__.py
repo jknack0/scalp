@@ -10,7 +10,10 @@ from src.strategies.base import (
     StrategyConfig,
 )
 from src.strategies.cvd_divergence import CVDDivergenceStrategy
-from src.strategies.donchian_breakout import DonchianBreakoutStrategy
+from src.strategies.donchian_breakout_trend import DonchianBreakoutTrendStrategy
+from src.strategies.donchian_fade import DonchianFadeStrategy
+from src.strategies.donchian_midline import DonchianMidlineStrategy
+from src.strategies.donchian_squeeze import DonchianSqueezeStrategy
 from src.strategies.ema_ribbon_pullback import EmaRibbonPullbackStrategy
 from src.strategies.gap_fill import GapFillStrategy
 from src.strategies.ib_fade import IBFadeStrategy
@@ -35,7 +38,10 @@ __all__ = [
     "StrategyConfig",
     "StrategyBase",
     "CVDDivergenceStrategy",
-    "DonchianBreakoutStrategy",
+    "DonchianBreakoutTrendStrategy",
+    "DonchianFadeStrategy",
+    "DonchianMidlineStrategy",
+    "DonchianSqueezeStrategy",
     "EmaRibbonPullbackStrategy",
     "GapFillStrategy",
     "IBFadeStrategy",

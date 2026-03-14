@@ -1,0 +1,70 @@
+# Donchian Flavor 2: Mean reversion fade
+# Fades Donchian band touches in RANGE_BOUND regime. RSI oversold/overbought
+# confirmation. Targets VWAP/midline reversion with tight stops.
+# Session: 11:00 AM - 3:00 PM ET (best for mean reversion).
+
+strategy:
+  strategy_id: donchian_fade
+  max_signals_per_day: 4
+  session_start: "11:00"
+  session_end: "15:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+signals: [donchian_channel, adx, rsi_momentum, stochastic, atr, session_time, regime_v2, vwap_session, relative_volume]
+signal_configs:
+  donchian_channel:
+    entry_period: 20
+    exit_period: 10
+    touch_tolerance_ticks: 2
+  adx:
+    period: 14
+    threshold: 20.0
+  rsi_momentum:
+    period: 14
+    long_threshold: 50.0
+    short_threshold: 50.0
+  regime_v2:
+    model_path: models/regime_v2
+    pass_states: [RANGING]
+
+fade:
+  target_atr: 1.5
+  stop_atr: 1.25
+  rsi_oversold: 30.0
+  rsi_overbought: 70.0
+  use_vwap_target: true
+
+# Declarative entry filters (AND logic)
+filters:
+  # Session: 11:00 AM - 3:00 PM ET
+  - signal: session_time
+    expr: ">= 660"
+  - signal: session_time
+    expr: "<= 900"
+  # ADX ceiling: only trade when trend is WEAK (range-bound)
+  - signal: adx
+    expr: "< 20.0"
+  # Regime: RANGE_BOUND only
+  - signal: regime_v2
+    expr: passes
+
+exit:
+  time_stop_minutes: 30
+
+# Dynamic exits (ExitEngine, OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 20
+  # Exit if regime shifts to TRENDING (fade thesis invalidated)
+  - type: regime_exit
+    enabled: true
+    exit_on_regime: [TRENDING]

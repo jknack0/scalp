@@ -1121,13 +1121,35 @@ class RegimeDetectorV2:
 
     # ── Batch prediction (backtest) ──────────────────────────────────
 
+    def _forward_only_proba(self, features: np.ndarray) -> np.ndarray:
+        """Compute causal forward-only filtering probabilities.
+
+        Returns P(state_t | obs_1..t) using only the forward pass,
+        NOT the smoothed P(state_t | obs_1..T) from forward-backward.
+        This prevents future information leakage in backtests.
+        """
+        from hmmlearn import _hmmc
+
+        log_frameprob = self.model._compute_log_likelihood(features)
+        _, fwdlattice = _hmmc.forward_log(
+            self.model.startprob_, self.model.transmat_, log_frameprob
+        )
+        # fwdlattice is log P(obs_1..t, state_t) — normalize to get P(state_t | obs_1..t)
+        from scipy.special import logsumexp
+        log_norm = logsumexp(fwdlattice, axis=1, keepdims=True)
+        log_posteriors = fwdlattice - log_norm
+        return np.exp(log_posteriors)
+
     def predict_proba_sequence(
-        self, features: np.ndarray
+        self, features: np.ndarray, *, causal: bool = False,
     ) -> list[RegimeProba]:
-        """Forward-only batch inference over a feature sequence.
+        """Batch inference over a feature sequence.
 
         Returns one RegimeProba per row, with anti-whipsaw applied.
-        Uses predict_proba() (forward-backward), NOT predict() (Viterbi).
+
+        Args:
+            causal: If True, use forward-only filtering (no future leakage).
+                    If False (default), use forward-backward smoothing.
         """
         assert self.model is not None and self.state_map is not None
 
@@ -1140,7 +1162,9 @@ class RegimeDetectorV2:
         n = len(features)
 
         # Get posteriors from the appropriate backend
-        if cfg.emission_type == "gaussian":
+        if causal and cfg.emission_type == "gaussian":
+            proba_matrix = self._forward_only_proba(features)  # (T, n_states)
+        elif cfg.emission_type == "gaussian":
             proba_matrix = self.model.predict_proba(features)  # (T, n_states)
         else:
             X = torch.tensor(features, dtype=torch.float32).unsqueeze(0)

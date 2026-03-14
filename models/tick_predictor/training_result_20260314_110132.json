@@ -1,0 +1,26 @@
+{
+  "cv_accuracy_mean": 0.5289077140036109,
+  "cv_accuracy_std": 0.015538866273531151,
+  "val_ece": 0.005138815231183059,
+  "val_brier_score": 0.5084661244162373,
+  "val_accuracy": 0.542005558365154,
+  "temperature": 0.9924508595238005,
+  "top_features": {
+    "microprice": 101091.05980110168,
+    "return_1": 52323.56931972504,
+    "spread": 9195.603912353516,
+    "volume_imbalance_10": 8210.854031562805,
+    "cvd_delta_10": 6389.553956031799,
+    "volume_zscore_20": 6104.338172912598,
+    "cvd_delta_30": 4174.334432601929,
+    "obi_5": 3943.514207839966,
+    "return_10": 3917.5139150619507,
+    "return_autocorr_10": 3162.828616142273
+  },
+  "training_samples": 6082006,
+  "val_samples": 215531,
+  "model_path": "models\\tick_predictor\\lgbm_latest.txt",
+  "calibrator_path": "models\\tick_predictor\\calibrator_latest.pkl",
+  "success": true,
+  "error_message": null
+}

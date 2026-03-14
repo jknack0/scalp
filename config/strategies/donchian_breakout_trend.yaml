@@ -1,0 +1,81 @@
+# Donchian Flavor 1: Breakout trend-following
+# Enters on Donchian channel breakout in TRENDING regime with ADX, RVOL,
+# and VWAP bias confirmation. Session: 10:30 AM - 3:00 PM ET.
+
+strategy:
+  strategy_id: donchian_breakout_trend
+  max_signals_per_day: 3
+  session_start: "10:30"
+  session_end: "15:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+signals: [donchian_channel, adx, relative_volume, atr, session_time, regime_v2, vwap_bias, ema_crossover]
+signal_configs:
+  donchian_channel:
+    entry_period: 20
+    exit_period: 10
+    width_percentile_lookback: 100
+    trend_lookback: 5
+  adx:
+    period: 14
+    threshold: 22.0
+  relative_volume:
+    lookback_bars: 20
+    high_threshold: 1.5
+  regime_v2:
+    model_path: models/regime_v2
+    pass_states: [TRENDING]
+
+donchian:
+  target_atr: 3.5
+  stop_atr: 1.75
+  width_min: 2.0
+  width_max: 30.0
+
+# Declarative entry filters (AND logic — all must pass)
+filters:
+  # Session: 10:30 AM - 3:00 PM ET
+  - signal: session_time
+    expr: ">= 630"
+  - signal: session_time
+    expr: "<= 900"
+  # Donchian breakout required
+  - signal: donchian_channel
+    expr: passes
+  # ADX trend strength gate
+  - signal: adx
+    expr: ">= 22.0"
+  # Volume confirmation
+  - signal: relative_volume
+    expr: ">= 1.5"
+  # Regime: TRENDING only
+  - signal: regime_v2
+    expr: passes
+
+exit:
+  time_stop_minutes: 45
+
+# Dynamic exits (ExitEngine, OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 30
+  # Trailing stop via 10-bar exit channel
+  - type: price_vs_signal_exit
+    enabled: true
+    signal: donchian_channel
+    long_field: exit_lower
+    short_field: exit_upper
+  # ADX collapse — trend dying
+  - type: signal_bound_exit
+    enabled: true
+    signal: adx
+    lower_bound: 18.0

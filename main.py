@@ -64,7 +64,10 @@ _STRATEGY_MAP: dict[str, tuple[str, str]] = {
     "micro": ("src.strategies.micro_pullback:MicroPullbackStrategy", "config/strategies/micro_pullback.yaml"),
     "regime": ("src.strategies.regime_switcher:RegimeSwitcherStrategy", "config/strategies/regime_switcher.yaml"),
     "pdh_pdl": ("src.strategies.pdh_pdl_fade:PDHPDLFadeStrategy", "config/strategies/pdh_pdl_fade.yaml"),
-    "donchian": ("src.strategies.donchian_breakout:DonchianBreakoutStrategy", "config/strategies/donchian_breakout.yaml"),
+    "donchian_breakout": ("src.strategies.donchian_breakout_trend:DonchianBreakoutTrendStrategy", "config/strategies/donchian_breakout_trend.yaml"),
+    "donchian_fade": ("src.strategies.donchian_fade:DonchianFadeStrategy", "config/strategies/donchian_fade.yaml"),
+    "donchian_midline": ("src.strategies.donchian_midline:DonchianMidlineStrategy", "config/strategies/donchian_midline.yaml"),
+    "donchian_squeeze": ("src.strategies.donchian_squeeze:DonchianSqueezeStrategy", "config/strategies/donchian_squeeze.yaml"),
     "mfi_obv": ("src.strategies.mfi_obv_divergence:MFIOBVDivergenceStrategy", "config/strategies/mfi_obv_divergence.yaml"),
     "ib": ("src.strategies.ib_fade:IBFadeStrategy", "config/strategies/ib_fade.yaml"),
 }
@@ -75,7 +78,7 @@ def _build_strategies(names: list[str] | None) -> list:
     import importlib
 
     if names is None:
-        names = ["vwap_band", "donchian"]
+        names = ["vwap_band", "donchian_breakout"]
 
     available = ", ".join(sorted(_STRATEGY_MAP.keys()))
     strategies = []

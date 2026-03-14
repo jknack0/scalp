@@ -1,0 +1,66 @@
+# Donchian Flavor 4: Squeeze breakout
+# Detects channel width compression then enters on breakout with high RVOL.
+# MACD histogram confirms direction. Wider stops/targets for vol expansion.
+# Session: 10:30 AM - 3:00 PM ET.
+
+strategy:
+  strategy_id: donchian_squeeze
+  max_signals_per_day: 2
+  session_start: "10:30"
+  session_end: "15:00"
+
+bar:
+  type: time
+  freq: 5m
+  enrich: false
+
+signals: [donchian_channel, relative_volume, macd, bollinger, atr, session_time]
+signal_configs:
+  donchian_channel:
+    entry_period: 20
+    exit_period: 10
+    width_percentile_lookback: 100
+    trend_lookback: 5
+  relative_volume:
+    lookback_bars: 20
+    high_threshold: 2.0
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+
+squeeze:
+  target_atr: 5.0
+  stop_atr: 2.5
+  width_percentile_max: 10.0
+  rvol_min: 2.0
+  min_squeeze_bars: 5
+
+# Declarative entry filters (AND logic)
+filters:
+  # Session: 10:30 AM - 3:00 PM ET
+  - signal: session_time
+    expr: ">= 630"
+  - signal: session_time
+    expr: "<= 900"
+  # Note: squeeze/breakout logic is stateful — handled in strategy code.
+  # FilterEngine only gates session time here. RVOL and MACD checks
+  # are also in strategy code since they're conditional on squeeze state.
+
+exit:
+  time_stop_minutes: 60
+
+# Dynamic exits (ExitEngine, OR logic)
+exits:
+  - type: bracket_target
+    enabled: true
+  - type: bracket_stop
+    enabled: true
+  - type: time_stop
+    enabled: true
+    max_bars: 40
+  # Trailing stop with wider buffer for vol expansion
+  - type: trailing_stop
+    enabled: true
+    atr_multiplier: 2.0
+    activation_atr: 2.0

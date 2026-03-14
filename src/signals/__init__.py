@@ -41,6 +41,7 @@ from src.signals.sma_trend import SMATrendConfig, SMATrendSignal
 from src.signals.stochastic import StochasticConfig, StochasticSignal
 from src.signals.macd import MACDConfig, MACDSignal
 from src.signals.value_area import ValueAreaConfig, ValueAreaSignal
+from src.signals.tick_predictor.signal import TickPredictorSignal
 
 __all__ = [
     "SignalBase",
@@ -109,4 +110,5 @@ __all__ = [
     "ValueAreaSignal",
     "RegimeV2Config",
     "RegimeV2Signal",
+    "TickPredictorSignal",
 ]
