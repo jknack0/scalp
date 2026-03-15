@@ -210,6 +210,7 @@ Structured logging via `structlog` (`src/core/logging.py`). Dual output: JSON ro
 - MES tick size: $1.25 per tick (0.25 index points x $5 multiplier)
 - Commission: $0.295/side, $0.59 round trip (Tradovate Free plan)
 
+<<<<<<< HEAD
 
 ## Remote execution (training/backtesting/optimization)
 
@@ -224,3 +225,19 @@ When running training, backtesting, or optimization scripts, **always write resu
   ```
 
 This allows progress and results to be checked remotely without an interactive terminal.
+=======
+## Remote Execution Workflow
+
+- Development happens on a ThinkPad T14s (Arch Linux + Hyprland)
+- Heavy training/backtesting runs on a Windows desktop (i7-10700KF, 32GB, RTX 4070 Super)
+- SSH alias `ssh desktop` connects ThinkPad → Windows OpenSSH → drops straight into Arch WSL2
+- Repo lives at `/mnt/c/Dev/scalp` on the desktop and `/dev/scalp` on the ThinkPad
+- Model artifacts (.pkl, .joblib, .pt, .h5, .parquet) are tracked via Git LFS
+
+### When executing training or backtest jobs:
+1. Run `ssh desktop` to connect to the desktop
+2. `cd /mnt/c/Dev/scalp`
+3. Run the appropriate script
+4. Tail logs, report results back
+5. Commit artifacts and push so ThinkPad can pull them
+>>>>>>> cd840ab (laptop to desktop)
