@@ -36,13 +36,20 @@ class RingBuffer:
             (self._buf[self._head :], self._buf[: self._head])
         )
 
-    def last(self, n: int = 1) -> np.ndarray:
-        """Return the last *n* values in chronological order."""
+    def get_window(self, n: int) -> np.ndarray:
+        """Return the last *n* values in chronological order.
+
+        Alias kept for backward compat with ``last()``.
+        """
         if n <= 0 or self._count == 0:
             return np.empty(0, dtype=np.float64)
         n = min(n, self._count)
         arr = self.get_array()
         return arr[-n:]
+
+    def last(self, n: int = 1) -> np.ndarray:
+        """Return the last *n* values in chronological order."""
+        return self.get_window(n)
 
     def is_full(self) -> bool:
         return self._count >= self._capacity

@@ -56,16 +56,28 @@ calibration:
   ece_alert_threshold: 0.08
   min_samples_for_recal: 50
 
+# ─────────────────────────────────────────────────────────────────
+# CRITICAL: inference.tp_ticks and inference.sl_ticks must always
+# equal labels.tp_ticks and labels.sl_ticks. The model predicts
+# P(TP hit first) and P(SL hit first) for these specific barriers.
+# Changing one without retraining the other produces invalid EV.
+# ─────────────────────────────────────────────────────────────────
 inference:
-  horizon_bars: 15
+  # These MUST match labels: section exactly — EV is only valid for the
+  # same TP/SL the model was trained to predict.
+  tp_ticks: 4           # 4 ticks = 1.00 point = $5.00 MES profit target
+  sl_ticks: 3           # 3 ticks = 0.75 point = $3.75 MES stop loss
+  cost_ticks: 0.72      # round-trip: 2×$0.295 commission + ~$0.31 slippage / $1.25 per tick
+  horizon_bars: 15      # must match labels.vertical_barrier_bars
+
+  # EV thresholds — tune these after first live validation run
+  ev_entry_threshold: 0.15    # min ev_normalized to consider a trade
+                               # = EV must be at least 15% of TP after costs
+  ev_strong_threshold: 0.30   # high conviction — used for Kelly sizing multiplier
+
+  # Performance monitoring
   latency_warn_us: 500
   latency_history_size: 1000
-
-strategy_integration:
-  filter_min_confidence: 0.60
-  sizing_enabled: false
-  kelly_fraction: 0.25
-  sizing_min_confidence: 0.62
 
 training:
   lookback_days: 15

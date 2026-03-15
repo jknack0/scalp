@@ -1,7 +1,7 @@
-"""TickPredictorSignal — SignalBase integration for direction prediction.
+"""TickPredictorSignal — SignalBase integration for EV-based prediction.
 
-Registered as "tick_predictor" in SignalRegistry.  Returns a signed float
-encoding direction + confidence: positive = UP, negative = DOWN, ~0 = FLAT.
+Registered as "tick_predictor" in SignalRegistry.  Returns normalized expected
+value: positive = long edge, negative = short edge, magnitude = strength.
 """
 
 from __future__ import annotations
@@ -47,8 +47,8 @@ class TickPredictorSignal(SignalBase):
 
     def __init__(self, config: dict | None = None) -> None:
         config = config or {}
-        self._horizon_ticks = config.get("horizon_ticks", 15)
-        self._min_confidence = config.get("min_confidence", 0.60)
+        self.config = config
+        self._horizon_ticks = config.get("horizon_bars", 15)
         model_path = config.get("model_path", "models/tick_predictor/lgbm_latest.txt")
         calibrator_path = config.get(
             "calibrator_path", "models/tick_predictor/calibrator_latest.pkl"
@@ -99,6 +99,7 @@ class TickPredictorSignal(SignalBase):
         self._model_loaded = self._model is not None
         self._is_warm = False
         self._last_prediction: PredictionRecord | None = None
+        self._last_result: SignalResult | None = None
 
         # Latency tracking
         self._latency_deque: deque[float] = deque(maxlen=1000)
@@ -159,21 +160,37 @@ class TickPredictorSignal(SignalBase):
         if latency_us > 500:
             logger.warning("tick_predictor_slow_inference", latency_us=f"{latency_us:.0f}")
 
-        direction_idx = int(np.argmax(cal_proba[0]))
-        direction = DIRECTION_NAMES[direction_idx]
-        confidence = float(cal_proba[0, direction_idx])
+        p_down = float(cal_proba[0, 0])
+        p_flat = float(cal_proba[0, 1])
+        p_up = float(cal_proba[0, 2])
+
+        tp_ticks = self.config.get("tp_ticks", 4)
+        sl_ticks = self.config.get("sl_ticks", 3)
+        cost_ticks = self.config.get("cost_ticks", 0.72)
+
+        # Raw EV in ticks
+        ev = (p_up * tp_ticks) - (p_down * sl_ticks) - cost_ticks
+
+        # Normalized EV: fraction of TP so FilterEngine thresholds are
+        # interpretable regardless of tp_ticks setting.
+        # 0.0 = breakeven after costs, 1.0 = full TP edge, -1.0 = full SL edge
+        ev_normalized = ev / tp_ticks
+
+        # Suggested direction — only meaningful when abs(ev_normalized) > threshold
+        ev_entry_threshold = self.config.get("ev_entry_threshold", 0.15)
+        if ev_normalized > ev_entry_threshold:
+            suggested_direction = "LONG"
+        elif ev_normalized < -ev_entry_threshold:
+            suggested_direction = "SHORT"
+        else:
+            suggested_direction = "FLAT"
 
         self._is_warm = True
 
-        # Encode direction + confidence as signed float
-        if direction == "UP":
-            value = confidence
-        elif direction == "DOWN":
-            value = -confidence
-        else:
-            value = 0.0
-
         # Record prediction for recalibration
+        direction_idx = int(np.argmax(cal_proba[0]))
+        direction = DIRECTION_NAMES[direction_idx]
+        confidence = float(cal_proba[0, direction_idx])
         record = PredictionRecord(
             timestamp_ns=latest_bar.timestamp_ns,
             raw_proba=raw_proba[0].copy(),
@@ -184,21 +201,28 @@ class TickPredictorSignal(SignalBase):
         self._prediction_history.append(record)
         self._pending_outcomes.append((latest_bar.timestamp_ns, latest_bar.close))
 
-        return SignalResult(
-            value=value,
+        result = SignalResult(
+            value=ev_normalized,
             passes=True,
-            direction="long" if direction == "UP" else ("short" if direction == "DOWN" else "none"),
+            direction="long" if suggested_direction == "LONG" else (
+                "short" if suggested_direction == "SHORT" else "none"
+            ),
             metadata={
-                "direction": direction,
-                "confidence": confidence,
-                "up_prob": float(cal_proba[0, 2]),
-                "down_prob": float(cal_proba[0, 0]),
-                "flat_prob": float(cal_proba[0, 1]),
+                "ev": ev,
+                "ev_normalized": ev_normalized,
+                "p_up": p_up,
+                "p_down": p_down,
+                "p_flat": p_flat,
+                "suggested_direction": suggested_direction,
+                "tp_ticks": tp_ticks,
+                "sl_ticks": sl_ticks,
+                "cost_ticks": cost_ticks,
                 "is_warm": self._is_warm,
-                "horizon_ticks": self._horizon_ticks,
                 "latency_us": latency_us,
             },
         )
+        self._last_result = result
+        return result
 
     def reset(self) -> None:
         """Clear state on session close."""
@@ -246,6 +270,28 @@ class TickPredictorSignal(SignalBase):
     def set_regime_signal(self, regime_signal) -> None:
         """Wire up a RegimeV2Signal instance for HMM features."""
         self._regime_signal = regime_signal
+
+    def kelly_fraction(self, direction: str) -> float:
+        """Quarter-Kelly position sizing fraction for the current prediction.
+
+        Args:
+            direction: "LONG" or "SHORT"
+
+        Returns:
+            0.0 if predictor not warm or EV is negative for that direction.
+        """
+        if not self._is_warm or self._last_result is None:
+            return 0.0
+        meta = self._last_result.metadata
+        tp = meta["tp_ticks"]
+        sl = meta["sl_ticks"]
+        b = tp / sl  # win/loss ratio
+        p_win = meta["p_up"] if direction == "LONG" else meta["p_down"]
+        p_lose = meta["p_down"] if direction == "LONG" else meta["p_up"]
+        kelly = (b * p_win - p_lose) / b
+        if kelly <= 0:
+            return 0.0
+        return kelly * 0.25  # quarter Kelly
 
     # ── internals ───────────────────────────────────────────────
 

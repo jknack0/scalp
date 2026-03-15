@@ -1,8 +1,7 @@
-"""TickDirectionPredictor — Phase 13 signal.
+"""TickDirectionPredictor — Phase 13 signal (EV output).
 
-Predicts MES tick direction 15 bars (15 seconds) ahead from OHLCV-1s order flow
-features.  Output: signed float encoding direction + confidence for use in
-FilterEngine and ExitEngine.
+Predicts MES tick direction ahead from OHLCV-1s features and outputs normalized
+expected value.  Positive EV = long edge, negative = short edge.
 
 Architecture::
 
@@ -10,41 +9,59 @@ Architecture::
       -> BarEvent (EventBus)
         -> SignalEngine.compute(bar_window)
           -> TickPredictorSignal.compute()
-            -> FeatureBuilder.on_bar() -> feature_vector (18,)
+            -> FeatureBuilder.on_bar() -> feature_vector (26,)
               -> LightGBM.predict() -> raw_proba (3,)
                 -> TemperatureCalibrator -> cal_proba (3,)
-                  -> SignalResult(value=signed_confidence, metadata={...})
+                  -> EV = (p_up * tp) - (p_down * sl) - cost
+                    -> SignalResult(value=ev_normalized, metadata={...})
 
 Value Encoding
 --------------
-SignalResult.value encodes direction + confidence as a single float:
-  value > 0  -> UP,   magnitude = confidence  (e.g.  0.72 = UP   72%)
-  value < 0  -> DOWN, magnitude = confidence  (e.g. -0.68 = DOWN 68%)
-  value ~ 0  -> FLAT
+SignalResult.value = ev_normalized = EV / tp_ticks:
+  value > 0  -> long edge,  magnitude = fraction of TP  (e.g. 0.20 = 20% of TP)
+  value < 0  -> short edge, magnitude = fraction of TP  (e.g. -0.15 = 15% of TP)
+  value ~ 0  -> no edge (cost > expected gain)
 
 Strategy YAML Integration
 -------------------------
-Recommended ExitEngine patterns (zero changes to ExitEngine required):
+Standalone entry (strategy YAML):
 
-  # Pattern 1 -- Adverse signal exit (exit if predictor flips against position)
+  filters:
+    # Take LONG only when model shows positive EV above entry threshold
+    - signal: tick_predictor
+      expr: "> 0.15"
+
+    # Take SHORT only when model shows negative EV
+    - signal: tick_predictor
+      expr: "< -0.15"
+
+    # High conviction only
+    - signal: tick_predictor
+      expr: "> 0.30"
+
+As filter for existing strategies (e.g. gate a LONG ORB entry):
+
+  filters:
+    # Block LONG entry if model sees negative EV
+    - signal: tick_predictor
+      expr: "> 0.0"
+
+ExitEngine patterns (zero changes to ExitEngine required):
+
+  # Adverse signal exit (exit LONG if EV flips negative)
   exits:
     - type: adverse_signal_exit
       enabled: true
       signal: tick_predictor
-      adverse_threshold: -0.60
+      adverse_threshold: -0.15
 
-  # Pattern 2 -- Signal bound exit (exit if confidence collapses)
+  # Signal bound exit (exit if EV collapses toward zero)
   exits:
     - type: signal_bound_exit
       enabled: true
       signal: tick_predictor
-      lower_bound: -0.30
-      upper_bound: 0.30
-
-  # Pattern 3 -- FilterEngine gate (only trade when predictor is aligned)
-  filters:
-    - signal: tick_predictor
-      expr: "> 0.55"
+      lower_bound: -0.10
+      upper_bound: 0.10
 """
 
 from src.signals.tick_predictor.signal import TickPredictorSignal

@@ -1,0 +1,21 @@
+{
+  "cv_accuracy_mean": 0.5776445652269508,
+  "cv_accuracy_std": 0.013573657260705214,
+  "val_ece": 0.006193443275212849,
+  "val_accuracy": 0.6066838046272494,
+  "temperature": 0.7462055732030481,
+  "n_train": 7534,
+  "n_val": 389,
+  "top_features": {
+    "regime_p_ranging": 41.81559944152832,
+    "realized_vol_12": 37.397300720214844,
+    "regime_p_trending": 35.843899726867676,
+    "cvd_3bar": 34.65629959106445,
+    "autocorr_6": 32.903550148010254,
+    "ofi_1bar": 27.284899711608887,
+    "hl_range_zscore": 22.08989906311035,
+    "vpin_12bar": 13.978400230407715,
+    "cvd_slope_5bar": 12.674799919128418,
+    "microprice_drift": 8.58413028717041
+  }
+}

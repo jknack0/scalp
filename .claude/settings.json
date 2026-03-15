@@ -100,7 +100,20 @@
       "Bash(tee logs/tick_predictor_oos_v5_sweep.log)",
       "Bash(tee logs/tick_predictor_oos_v5_noleak_sweep.log)",
       "Bash(tee logs/tick_predictor_v6_train.log)",
-      "Bash(tee logs/tick_predictor_oos_v6_sweep.log)"
+      "Bash(tee logs/tick_predictor_oos_v6_sweep.log)",
+      "Bash(tee logs/tick_5m_train.log)",
+      "Bash(tee logs/tick_5m_oos_sweep.log)",
+      "Bash(tee logs/tick_15m_train.log)",
+      "Bash(tee logs/tick_30m_train.log)",
+      "Bash(tee logs/tick_15m_oos.log)",
+      "Bash(tee logs/tick_30m_oos.log)",
+      "Bash(tee logs/tick_pred_v2_15m.log)",
+      "Bash(tee logs/tick_pred_v2_30m.log)",
+      "Bash(tee logs/tick_pred_v2_1m_h1_tp4.log)",
+      "Bash(tee logs/tick_pred_v3_lag5_1m.log)",
+      "Bash(tee logs/tick_pred_v4_l1_1m.log)",
+      "Bash(tee logs/tick_pred_v4_l1_5m.log)",
+      "Bash(find /c/Dev/scalp -name *.md -type f)"
     ],
     "additionalDirectories": [
       "C:\\Dev\\scalp\\.venv"
